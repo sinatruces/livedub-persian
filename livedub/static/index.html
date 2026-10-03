@@ -1,0 +1,469 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>livedub — ترجمه صدا به فارسی</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #f5f6f8; --surface: #ffffff; --text: #1b2130; --muted: #5f6b7d; --border: #e2e6ec;
+    --accent: #0f766e; --accent-strong: #0b5f58; --accent-soft: #e3f3f1; --on-accent: #ffffff;
+    --danger: #b42318; --danger-soft: #fdeceb; --ok: #067647; --ok-soft: #e5f6ec;
+    --warn: #8a5300; --warn-soft: #fff4dc; --track: #e9edf2;
+    --radius: 14px; --shadow: 0 1px 2px rgba(16, 24, 40, .06);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1116; --surface: #161a21; --text: #e7eaef; --muted: #9aa4b2; --border: #272d37;
+      --accent: #2cc4b1; --accent-strong: #5fd8c8; --accent-soft: rgba(44, 196, 177, .13); --on-accent: #06221f;
+      --danger: #f97066; --danger-soft: rgba(249, 112, 102, .12); --ok: #47cd89; --ok-soft: rgba(71, 205, 137, .12);
+      --warn: #fdb022; --warn-soft: rgba(253, 176, 34, .12); --track: #232934;
+      --shadow: none;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.75 Vazirmatn, Tahoma, system-ui, sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 32px 16px 48px; }
+  header { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+  h1 { margin: 0; font-size: 26px; font-weight: 700; letter-spacing: -.3px; }
+  h1 span { color: var(--accent); }
+  .tagline { margin: 2px 0 0; color: var(--muted); }
+  .key-status { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+  h2 { margin: 0 0 12px; font-size: 17px; font-weight: 700; }
+  .card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 20px; margin-bottom: 16px; box-shadow: var(--shadow);
+  }
+  .card.warn { background: var(--warn-soft); border-color: transparent; color: var(--text); }
+  .card.warn code { direction: ltr; unicode-bidi: embed; }
+  p { margin: 0 0 10px; }
+  a { color: var(--accent); }
+  code { font-family: ui-monospace, Consolas, monospace; font-size: 13px; background: var(--track); padding: 1px 6px; border-radius: 6px; }
+  .muted { color: var(--muted); }
+  .small { font-size: 13px; }
+
+  form.key { display: flex; gap: 8px; flex-wrap: wrap; }
+  input[type=password], select {
+    font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--border);
+    border-radius: 10px; padding: 8px 12px; min-height: 42px;
+  }
+  input[type=password] { flex: 1 1 260px; direction: ltr; text-align: left; }
+  input:focus-visible, select:focus-visible, button:focus-visible, a:focus-visible, .drop:focus-within {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+  }
+  button, .btn {
+    font: inherit; font-weight: 500; cursor: pointer; border-radius: 10px; min-height: 42px;
+    padding: 8px 18px; border: 1px solid transparent; text-decoration: none;
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  }
+  button.primary { background: var(--accent); color: var(--on-accent); }
+  button.primary:hover:not(:disabled) { background: var(--accent-strong); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .btn { background: var(--accent-soft); color: var(--accent); }
+  .btn:hover { filter: brightness(.97); }
+  button.link { background: none; border: none; color: var(--muted); padding: 4px 8px; min-height: 0; font-size: 13px; }
+  button.link:hover { color: var(--text); }
+  button.link.danger:hover { color: var(--danger); }
+
+  .drop {
+    display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center;
+    gap: 4px; padding: 28px 16px; border: 1.5px dashed var(--border); border-radius: 12px;
+    cursor: pointer; transition: border-color .15s, background .15s;
+  }
+  .drop:hover, .drop.over { border-color: var(--accent); background: var(--accent-soft); }
+  .drop input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+  .drop strong { font-weight: 500; }
+  .chosen { margin: 10px 0 0; padding: 0; list-style: none; font-size: 13px; color: var(--muted); }
+  .chosen li { overflow-wrap: anywhere; }
+  .row { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin: 16px 0; }
+  .row label { display: flex; align-items: center; gap: 8px; }
+  .check input { width: 18px; height: 18px; accent-color: var(--accent); }
+  .msg { margin: 10px 0 0; min-height: 1em; font-size: 14px; }
+  .msg.error { color: var(--danger); }
+  .msg.ok { color: var(--ok); }
+  .msg.warn { color: var(--warn); }
+
+  .jobs-head { display: flex; align-items: baseline; justify-content: space-between; margin: 28px 0 12px; }
+  .jobs-head h2 { margin: 0; }
+  .job { padding: 16px 18px; }
+  .job-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .job-name { font-weight: 500; overflow-wrap: anywhere; }
+  .badge { flex: none; font-size: 12px; font-weight: 500; padding: 2px 10px; border-radius: 999px; background: var(--track); color: var(--muted); }
+  .badge.running { background: var(--accent-soft); color: var(--accent); }
+  .badge.done { background: var(--ok-soft); color: var(--ok); }
+  .badge.error { background: var(--danger-soft); color: var(--danger); }
+  .bar { height: 6px; border-radius: 999px; background: var(--track); overflow: hidden; margin: 12px 0 6px; }
+  .fill { height: 100%; width: 0; background: var(--accent); border-radius: inherit; transition: width .6s ease; }
+  .bar.waiting .fill { width: 30%; animation: slide 1.4s ease-in-out infinite; }
+  @keyframes slide { from { transform: translateX(110%); } to { transform: translateX(-340%); } }
+  @media (prefers-reduced-motion: reduce) { .bar.waiting .fill { animation: none; width: 100%; opacity: .35; } }
+  .job-meta { font-size: 13px; color: var(--muted); }
+  .job-error { margin: 8px 0 0; padding: 8px 12px; border-radius: 8px; background: var(--danger-soft); color: var(--danger);
+    font: 12px/1.6 ui-monospace, Consolas, monospace; overflow-wrap: anywhere; text-align: left; }
+  .job-result { margin-top: 12px; }
+  audio { width: 100%; height: 40px; }
+  .links { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  details { margin-top: 10px; font-size: 14px; }
+  summary { cursor: pointer; color: var(--muted); }
+  summary:hover { color: var(--text); }
+  details[open] summary { margin-bottom: 8px; }
+  .transcript p { white-space: pre-wrap; background: var(--bg); padding: 12px; border-radius: 10px; margin: 0; }
+  .job-actions { display: flex; justify-content: flex-end; margin-top: 6px; }
+  .empty { color: var(--muted); text-align: center; padding: 24px 0; }
+  .offline { position: fixed; inset: auto 16px 16px; max-width: 728px; margin: 0 auto; padding: 10px 14px;
+    border-radius: 10px; background: var(--danger); color: #fff; font-size: 14px; text-align: center; }
+  footer { margin-top: 28px; color: var(--muted); font-size: 13px; text-align: center; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>live<span>dub</span></h1>
+      <p class="tagline">صدای فایل‌هاتون رو با Gemini به فارسی ترجمه کنید</p>
+    </div>
+    <div class="key-status">
+      <span id="key-status"></span>
+      <button class="link" id="change-key" hidden>تغییر کلید</button>
+    </div>
+  </header>
+
+  <section class="card warn" id="ffmpeg-warn" hidden>
+    <h2>ffmpeg نصب نیست</h2>
+    <p>برای خوندن فایل‌ها لازمه. نصبش کنید، پنجره ترمینال رو ببندید و دوباره اجرا کنید:</p>
+    <p class="small">ویندوز: <code>winget install Gyan.FFmpeg</code> · مک: <code>brew install ffmpeg</code> · لینوکس: <code>sudo apt install ffmpeg</code></p>
+  </section>
+
+  <section class="card" id="setup" hidden>
+    <h2>کلید Gemini API</h2>
+    <p class="muted small">فقط یک بار لازمه؛ روی همین کامپیوتر در فایل <code>.env</code> ذخیره میشه.
+      کلید رو از <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a> بگیرید.</p>
+    <form class="key" id="key-form">
+      <input type="password" id="key" placeholder="AIza…" autocomplete="off" spellcheck="false" aria-label="کلید API">
+      <button class="primary" id="key-save">ذخیره و بررسی</button>
+    </form>
+    <p class="msg" id="key-msg" role="status"></p>
+  </section>
+
+  <section class="card" id="upload">
+    <h2>فایل جدید</h2>
+    <label class="drop" id="drop">
+      <input type="file" id="files" multiple accept="audio/*,video/*,.mkv,.opus,.wma,.amr">
+      <strong>فایل‌ها رو اینجا بکشید یا کلیک کنید</strong>
+      <span class="muted small">mp3، wav، m4a، mp4، mkv و بقیه فرمت‌های صوتی و ویدیویی</span>
+    </label>
+    <ul class="chosen" id="chosen"></ul>
+    <div class="row">
+      <label>زبان مقصد
+        <select id="lang">
+          <option value="fa" selected>فارسی</option>
+          <option value="en">انگلیسی</option>
+          <option value="ar">عربی</option>
+          <option value="tr">ترکی</option>
+          <option value="de">آلمانی</option>
+          <option value="fr">فرانسوی</option>
+          <option value="es">اسپانیایی</option>
+        </select>
+      </label>
+      <label class="check"><input type="checkbox" id="save-text"> متن ترجمه هم ذخیره بشه</label>
+    </div>
+    <button class="primary" id="start" disabled>شروع ترجمه</button>
+    <p class="msg" id="upload-msg" role="status"></p>
+  </section>
+
+  <div class="jobs-head">
+    <h2>کارها</h2>
+    <span class="muted small" id="model"></span>
+  </div>
+  <div id="jobs"></div>
+  <p class="empty" id="empty">هنوز فایلی نفرستادید. برای شروع، یک فایل کوتاه (۲-۳ دقیقه) امتحان کنید.</p>
+
+  <footer>ترجمه با سرعت پخش عادی انجام میشه؛ یعنی فایل ۱۰ دقیقه‌ای حدود ۱۰ دقیقه طول می‌کشه.
+    تا وقتی کار تموم نشده، پنجره ترمینال رو نبندید.</footer>
+</main>
+<div class="offline" id="offline" hidden>ارتباط با برنامه قطع شده. پنجره ترمینال هنوز بازه؟</div>
+
+<script>
+const $ = (sel, root = document) => root.querySelector(sel);
+const FA_DIGITS = '۰۱۲۳۴۵۶۷۸۹';
+const faDigits = (s) => String(s).replace(/\d/g, (d) => FA_DIGITS[d]);
+const fa = (n) => faDigits(n);
+function clock(sec) {
+  sec = Math.max(0, Math.round(sec));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  const ss = String(s).padStart(2, '0');
+  return faDigits(h ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`);
+}
+async function api(path, options = {}) {
+  const res = await fetch(path, options);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+  return body;
+}
+function say(el, text, kind = '') {
+  el.textContent = text;
+  el.className = `msg ${kind}`;
+}
+
+// --- status and API key ---
+let hasKey = false;
+let uploading = false;
+
+async function loadStatus() {
+  const s = await api('/api/status');
+  hasKey = s.has_key;
+  $('#setup').hidden = s.has_key;
+  $('#change-key').hidden = !s.has_key;
+  const keyStatus = $('#key-status');
+  if (s.has_key) {
+    const hint = document.createElement('bdi');
+    hint.dir = 'ltr';
+    hint.textContent = `…${s.key_hint}`;
+    keyStatus.replaceChildren('کلید API: ', hint);
+  } else {
+    keyStatus.textContent = 'کلید API وارد نشده';
+  }
+  $('#ffmpeg-warn').hidden = s.ffmpeg;
+  $('#model').textContent = s.model;
+  $('#model').dir = 'ltr';
+  updateStart();
+}
+
+$('#change-key').addEventListener('click', () => {
+  $('#setup').hidden = false;
+  $('#key').focus();
+});
+
+$('#key-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const key = $('#key').value.trim();
+  if (!key) return;
+  const button = $('#key-save');
+  button.disabled = true;
+  say($('#key-msg'), 'در حال بررسی کلید…');
+  try {
+    const res = await api('/api/key', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key }),
+    });
+    $('#key').value = '';
+    await loadStatus();
+    if (res.warning) {
+      $('#setup').hidden = false;
+      say($('#key-msg'), res.warning, 'warn');
+    } else {
+      say($('#key-msg'), '');
+      say($('#upload-msg'), 'کلید ذخیره شد. حالا یک فایل انتخاب کنید.', 'ok');
+    }
+  } catch (err) {
+    say($('#key-msg'), err.message, 'error');
+  } finally {
+    button.disabled = false;
+  }
+});
+
+// --- choosing and uploading files ---
+const input = $('#files');
+const drop = $('#drop');
+
+function showChosen() {
+  const list = $('#chosen');
+  list.replaceChildren(...[...input.files].map((f) => {
+    const li = document.createElement('li');
+    li.dir = 'auto';
+    li.textContent = `${f.name} (${fa((f.size / 1e6).toFixed(1))} مگابایت)`;
+    return li;
+  }));
+  updateStart();
+}
+function updateStart() {
+  $('#start').disabled = !hasKey || uploading || input.files.length === 0;
+}
+input.addEventListener('change', showChosen);
+['dragenter', 'dragover'].forEach((t) => drop.addEventListener(t, (e) => {
+  e.preventDefault();
+  drop.classList.add('over');
+}));
+['dragleave', 'drop'].forEach((t) => drop.addEventListener(t, () => drop.classList.remove('over')));
+drop.addEventListener('drop', (e) => {
+  e.preventDefault();
+  if (e.dataTransfer.files.length) {
+    input.files = e.dataTransfer.files;
+    showChosen();
+  }
+});
+
+$('#start').addEventListener('click', () => {
+  const form = new FormData();
+  form.append('lang', $('#lang').value);
+  form.append('save_text', $('#save-text').checked ? '1' : '0');
+  for (const f of input.files) form.append('file', f, f.name);
+
+  const msg = $('#upload-msg');
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/jobs');
+  xhr.upload.onprogress = (e) => {
+    if (e.lengthComputable) say(msg, `در حال ارسال فایل… ${fa(Math.floor((e.loaded / e.total) * 100))}٪`);
+  };
+  xhr.onload = () => {
+    uploading = false;
+    let body = {};
+    try { body = JSON.parse(xhr.responseText); } catch {}
+    if (xhr.status === 201) {
+      say(msg, '');
+      input.value = '';
+      showChosen();
+      refresh();
+    } else {
+      say(msg, body.error || `خطا (${xhr.status})`, 'error');
+      updateStart();
+    }
+  };
+  xhr.onerror = () => {
+    uploading = false;
+    say(msg, 'ارسال فایل ناموفق بود؛ برنامه هنوز در حال اجراست؟', 'error');
+    updateStart();
+  };
+  uploading = true;
+  updateStart();
+  say(msg, 'در حال ارسال فایل…');
+  xhr.send(form);
+});
+
+// --- job list ---
+const STATUS_LABEL = { running: 'در حال انجام', done: 'تمام شد', error: 'خطا', cancelled: 'لغو شد' };
+const cards = new Map();
+
+function createCard(job) {
+  const el = document.createElement('article');
+  el.className = 'card job';
+  el.innerHTML = `
+    <div class="job-head"><div class="job-name" dir="auto"></div><span class="badge"></span></div>
+    <div class="bar"><div class="fill"></div></div>
+    <div class="job-meta"></div>
+    <p class="job-error" dir="ltr" hidden></p>
+    <div class="job-result" hidden>
+      <audio controls preload="metadata"></audio>
+      <div class="links">
+        <a class="btn audio-link">دانلود صدای ترجمه (WAV)</a>
+        <a class="btn text-link" hidden>دانلود متن ترجمه</a>
+      </div>
+      <details class="transcript" hidden><summary>متن ترجمه</summary><p dir="auto"></p></details>
+    </div>
+    <details class="source"><summary>شنیدن فایل اصلی</summary><audio controls preload="none"></audio></details>
+    <div class="job-actions">
+      <button class="link cancel">لغو</button>
+      <button class="link danger remove">حذف</button>
+    </div>`;
+  $('.job-name', el).textContent = job.name;
+  $('.source audio', el).src = job.source_url;
+  $('.cancel', el).addEventListener('click', async () => {
+    await api(`/api/jobs/${job.id}/cancel`, { method: 'POST' }).catch(() => {});
+    refresh();
+  });
+  $('.remove', el).addEventListener('click', async () => {
+    if (!confirm('این کار و فایل‌هاش حذف بشن؟')) return;
+    await api(`/api/jobs/${job.id}`, { method: 'DELETE' }).catch(() => {});
+    refresh();
+  });
+  return { el, loaded: false };
+}
+
+function updateCard(card, job) {
+  const { el } = card;
+  const running = job.status === 'running';
+  const badge = $('.badge', el);
+  badge.textContent = STATUS_LABEL[job.status] || job.status;
+  badge.className = `badge ${job.status}`;
+
+  const bar = $('.bar', el);
+  bar.hidden = !running;
+  bar.classList.toggle('waiting', running && (job.duration === 0 || job.fraction >= 1));
+  $('.fill', bar).style.width = `${Math.round(job.fraction * 100)}%`;
+
+  const parts = [];
+  if (running) {
+    if (job.duration === 0) parts.push('آماده‌سازی فایل…');
+    else if (job.fraction < 1) parts.push(`ترجمه ${fa(Math.floor(job.fraction * 100))}٪`);
+    else parts.push('دریافت آخرین بخش ترجمه…');
+  }
+  if (job.duration) parts.push(`مدت فایل ${clock(job.duration)}`);
+  if (running && job.segments > 1) parts.push(`${fa(job.segments_done)} از ${fa(job.segments)} تکه تمام شده`);
+  parts.push(`${running ? 'زمان سپری‌شده' : 'زمان کل'} ${clock(job.elapsed)}`);
+  // Persian zero (۰) looks like a middle dot, so separate with the Persian comma.
+  $('.job-meta', el).textContent = parts.join('، ');
+
+  const error = $('.job-error', el);
+  error.hidden = job.status !== 'error';
+  error.textContent = job.error;
+
+  $('.cancel', el).hidden = !running;
+  $('.remove', el).hidden = running;
+
+  if (job.status === 'done' && !card.loaded) {
+    card.loaded = true;
+    $('.job-result', el).hidden = false;
+    $('.job-result audio', el).src = job.audio_url;
+    $('.audio-link', el).href = `${job.audio_url}?download=1`;
+    if (job.text_url) {
+      const link = $('.text-link', el);
+      link.hidden = false;
+      link.href = `${job.text_url}?download=1`;
+      fetch(job.text_url).then((r) => r.text()).then((text) => {
+        if (!text.trim()) return;
+        const box = $('.transcript', el);
+        $('p', box).textContent = text;
+        box.hidden = false;
+      });
+    }
+  }
+}
+
+function renderJobs(jobs) {
+  const container = $('#jobs');
+  $('#empty').hidden = jobs.length > 0;
+  const seen = new Set();
+  jobs.forEach((job, i) => {
+    seen.add(job.id);
+    let card = cards.get(job.id);
+    if (!card) {
+      card = createCard(job);
+      cards.set(job.id, card);
+    }
+    updateCard(card, job);
+    if (container.children[i] !== card.el) container.insertBefore(card.el, container.children[i] || null);
+  });
+  for (const [id, card] of cards) {
+    if (!seen.has(id)) {
+      card.el.remove();
+      cards.delete(id);
+    }
+  }
+}
+
+async function refresh() {
+  try {
+    renderJobs(await api('/api/jobs'));
+    if (!$('#offline').hidden) {
+      $('#offline').hidden = true;
+      loadStatus().catch(() => {});
+    }
+  } catch {
+    $('#offline').hidden = false;
+  }
+}
+
+loadStatus().catch(() => { $('#offline').hidden = false; });
+refresh();
+setInterval(refresh, 1500);
+</script>
+</body>
+</html>

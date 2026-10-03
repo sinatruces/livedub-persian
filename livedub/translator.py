@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from google.genai import errors, types
@@ -116,19 +117,23 @@ class Translator:
         self.idle_timeout = idle_timeout
         self.max_tail = max_tail
 
-    async def translate(self, pcm: bytes) -> SegmentResult:
+    async def translate(self, pcm: bytes, on_sent: Callable[[float], None] | None = None) -> SegmentResult:
+        """Translate `pcm`; `on_sent` is told how many seconds of it have been streamed so far."""
         collector = _Collector()
         async with self.client.aio.live.connect(model=self.model, config=self.config) as session:
             receiver = asyncio.create_task(collector.run(session))
             try:
-                await self._send(session, pcm, receiver)
+                await self._send(session, pcm, receiver, on_sent)
                 await self._wait_for_tail(collector, receiver)
             finally:
                 receiver.cancel()
                 await asyncio.gather(receiver, return_exceptions=True)
         return collector.result()
 
-    async def _send(self, session, pcm: bytes, receiver: asyncio.Task) -> None:
+    async def _send(
+        self, session, pcm: bytes, receiver: asyncio.Task, on_sent: Callable[[float], None] | None
+    ) -> None:
+        audio_bytes = len(pcm)
         pcm = pcm + silence(TRAILING_SILENCE_SECONDS, INPUT_RATE)
         chunk = int(INPUT_RATE * CHUNK_SECONDS) * SAMPLE_WIDTH
         bytes_per_second = INPUT_RATE * SAMPLE_WIDTH * self.pace
@@ -140,6 +145,8 @@ class Translator:
             await session.send_realtime_input(
                 audio=types.Blob(data=pcm[offset : offset + chunk], mime_type=INPUT_MIME)
             )
+            if on_sent:
+                on_sent(min(offset + chunk, audio_bytes) / (INPUT_RATE * SAMPLE_WIDTH))
             # Stream at (a multiple of) real time: the model is built for live speech.
             delay = start + (offset + chunk) / bytes_per_second - time.monotonic()
             if delay > 0:

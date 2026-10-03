@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +36,22 @@ class Job:
     output: Path
 
 
+@dataclass
+class Progress:
+    """Live view of one file's translation, updated in place by translate_file."""
+
+    duration: float = 0.0  # seconds of input audio; 0 until the file is decoded
+    segments: int = 0
+    segments_done: int = 0
+    streamed: dict[int, float] = field(default_factory=dict)  # seconds sent, per segment
+
+    @property
+    def fraction(self) -> float:
+        if not self.duration:
+            return 0.0
+        return min(1.0, sum(self.streamed.values()) / self.duration)
+
+
 def collect_jobs(inputs: list[Path], out_dir: Path, language: str) -> list[Job]:
     """Expand files and folders into jobs; folders are searched recursively and mirrored in out_dir."""
     jobs: list[Job] = []
@@ -63,11 +80,15 @@ def _retryable(exc: Exception) -> bool:
 
 
 async def translate_with_retry(
-    translator: Translator, pcm: bytes, retries: int, label: str
+    translator: Translator,
+    pcm: bytes,
+    retries: int,
+    label: str,
+    on_sent: Callable[[float], None] | None = None,
 ) -> SegmentResult:
     for attempt in range(retries + 1):
         try:
-            return await translator.translate(pcm)
+            return await translator.translate(pcm, on_sent)
         except Exception as e:
             if attempt == retries or not _retryable(e):
                 raise
@@ -85,18 +106,28 @@ async def translate_file(
     sessions: asyncio.Semaphore,
     retries: int = 2,
     save_text: bool = False,
+    progress: Progress | None = None,
 ) -> None:
+    progress = progress or Progress()
     pcm = await asyncio.to_thread(decode_to_pcm16, job.source)
     samples = np.frombuffer(pcm, dtype="<i2")
     bounds = split_points(samples, INPUT_RATE, segment_seconds)
     total = len(samples) / INPUT_RATE
+    progress.duration, progress.segments = total, len(bounds)
     log.info("%s: %.1f min of audio, %d segment(s)", job.source.name, total / 60, len(bounds))
 
     async def run(index: int, start: int, end: int) -> SegmentResult:
         label = f"{job.source.name} [{index + 1}/{len(bounds)}]"
         async with sessions:
             log.info("%s: translating %.0fs-%.0fs", label, start / INPUT_RATE, end / INPUT_RATE)
-            result = await translate_with_retry(translator, samples[start:end].tobytes(), retries, label)
+            result = await translate_with_retry(
+                translator,
+                samples[start:end].tobytes(),
+                retries,
+                label,
+                on_sent=lambda seconds: progress.streamed.__setitem__(index, seconds),
+            )
+        progress.segments_done += 1
         if not result.audio:
             log.warning("%s: no translated speech came back (music or silence?)", label)
         return result

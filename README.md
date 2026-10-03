@@ -5,25 +5,33 @@
 
 > اسکریپت روی سیستم خودتون اجرا میشه، ولی ترجمه روی سرور گوگل انجام میشه؛ پس اینترنت و کلید API لازمه، هزینه داره و صدای فایل‌ها برای گوگل فرستاده میشه.
 
-## پیش‌نیازها
+## ساده‌ترین راه: صفحه وب روی کامپیوتر خودتون
 
-- Python نسخه 3.11 یا جدیدتر
-- ffmpeg (برای خوندن هر نوع فایل صوتی/ویدیویی)
-  - ویندوز: `winget install ffmpeg`
-  - مک: `brew install ffmpeg`
-  - لینوکس: `sudo apt install ffmpeg`
-- کلید Gemini API از https://aistudio.google.com/apikey
+1. **Python 3.11 یا جدیدتر** رو از https://www.python.org/downloads/ نصب کنید (در ویندوز تیک «Add python.exe to PATH» رو بزنید).
+2. **ffmpeg** رو نصب کنید:
+   - ویندوز: `winget install Gyan.FFmpeg`
+   - مک: `brew install ffmpeg`
+   - لینوکس: `sudo apt install ffmpeg`
+3. این پروژه رو دانلود و از حالت فشرده خارج کنید.
+4. اجرا:
+   - ویندوز: روی **`start.bat`** دوبار کلیک کنید.
+   - مک/لینوکس: در ترمینال داخل پوشه پروژه بزنید `sh start.sh`
+5. مرورگر خودش صفحه **http://localhost:8000** رو باز می‌کنه. کلید Gemini API رو یک بار وارد کنید (از https://aistudio.google.com/apikey)، فایل رو انتخاب کنید و «شروع ترجمه» رو بزنید.
 
-## نصب
+بار اول نصب بسته‌ها چند دقیقه طول می‌کشه؛ دفعه‌های بعد سریعه. تا وقتی کار تموم نشده، پنجره ترمینال رو نبندید.
+در صفحه می‌تونید پیشرفت کار رو ببینید، ترجمه رو همون‌جا گوش بدید و فایل WAV (و متن ترجمه) رو دانلود کنید.
+فایل‌ها و نتیجه‌ها در پوشه `web_data` و کلید در فایل `.env` کنار پروژه ذخیره میشن.
+
+## خط فرمان (برای پردازش دسته‌ای)
+
+بعد از اینکه یک بار `start.bat` یا `start.sh` اجرا شد، محیط پایتون در پوشه `.venv` آماده‌ست:
 
 ```bash
-python -m venv .venv
 # ویندوز:      .venv\Scripts\activate
 # مک/لینوکس:  source .venv/bin/activate
-pip install -r requirements.txt
 ```
 
-تنظیم کلید:
+کلید رو تنظیم کنید:
 
 ```bash
 # مک/لینوکس
@@ -31,8 +39,6 @@ export GEMINI_API_KEY="کلید-شما"
 # ویندوز (PowerShell)
 $env:GEMINI_API_KEY="کلید-شما"
 ```
-
-## استفاده
 
 ```bash
 # یک فایل → output/lecture.fa.wav

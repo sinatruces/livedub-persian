@@ -81,17 +81,24 @@ async def run(args: argparse.Namespace, client) -> int:
     return 1 if failed else 0
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
+def setup_logging(verbose: bool) -> None:
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
+        level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
-    if not args.verbose:
-        # The SDK's own debug/info chatter is not useful here.
-        logging.getLogger("google_genai").setLevel(logging.WARNING)
-        logging.getLogger("websockets").setLevel(logging.WARNING)
+    if not verbose:
+        # The SDK's and web server's own chatter is not useful here.
+        for name in ("google_genai", "websockets", "aiohttp.access"):
+            logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def main(argv: list[str] | None = None) -> int:
+    if sys.version_info < (3, 11):
+        print("livedub needs Python 3.11 or newer.", file=sys.stderr)
+        return 1
+    args = parse_args(argv)
+    setup_logging(args.verbose)
 
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
