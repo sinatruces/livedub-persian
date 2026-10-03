@@ -118,6 +118,17 @@
   .empty { color: var(--muted); text-align: center; padding: 24px 0; }
   .offline { position: fixed; inset: auto 16px 16px; max-width: 728px; margin: 0 auto; padding: 10px 14px;
     border-radius: 10px; background: var(--danger); color: #fff; font-size: 14px; text-align: center; }
+  .modes { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; margin: 16px 0 0; padding: 0; border: 0; }
+  .modes legend { padding: 0; margin-bottom: 8px; font-weight: 500; }
+  .mode { display: flex; gap: 10px; align-items: flex-start; padding: 12px 14px; border: 1px solid var(--border);
+    border-radius: 12px; cursor: pointer; transition: border-color .15s, background .15s; }
+  .mode:hover { border-color: var(--accent); }
+  .mode:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+  .mode input { margin-top: 6px; accent-color: var(--accent); }
+  .mode strong { font-weight: 700; }
+  .mode small { display: block; color: var(--muted); font-size: 13px; line-height: 1.6; }
+  .tag { font-size: 11px; font-weight: 500; padding: 1px 8px; border-radius: 999px; background: var(--accent); color: var(--on-accent); margin-inline-start: 4px; }
+  .row .btn { min-height: 42px; }
   footer { margin-top: 28px; color: var(--muted); font-size: 13px; text-align: center; }
   [hidden] { display: none !important; }
 </style>
@@ -160,6 +171,19 @@
       <span class="muted small">mp3، wav، m4a، mp4، mkv و بقیه فرمت‌های صوتی و ویدیویی</span>
     </label>
     <ul class="chosen" id="chosen"></ul>
+    <fieldset class="modes">
+      <legend>روش ترجمه</legend>
+      <label class="mode">
+        <input type="radio" name="mode" value="quality" checked>
+        <span><strong>کیفیت بالا</strong><span class="tag">پیشنهادی</span>
+          <small>اول کل متن با دقت ترجمه میشه، بعد با صدای انتخابی شما خونده میشه. سریع‌تر از طول فایل.</small></span>
+      </label>
+      <label class="mode">
+        <input type="radio" name="mode" value="live">
+        <span><strong>ترجمه زنده</strong>
+          <small>مترجم همزمان (Live Translate). ترجمه و صدا طبیعی نیست؛ هم‌اندازه طول فایل زمان می‌بره.</small></span>
+      </label>
+    </fieldset>
     <div class="row">
       <label>زبان مقصد
         <select id="lang">
@@ -172,8 +196,19 @@
           <option value="es">اسپانیایی</option>
         </select>
       </label>
-      <label class="check"><input type="checkbox" id="save-text"> متن ترجمه هم ذخیره بشه</label>
+      <label class="check live-only" hidden><input type="checkbox" id="save-text"> متن ترجمه هم ذخیره بشه</label>
     </div>
+    <div class="row quality-only">
+      <label>صدا <select id="voice"></select></label>
+      <button type="button" class="btn" id="sample">▶ شنیدن نمونه صدا</button>
+      <label>لحن
+        <select id="style">
+          <option value="formal" selected>روایی و روان</option>
+          <option value="casual">محاوره‌ای</option>
+        </select>
+      </label>
+    </div>
+    <p class="msg" id="sample-msg" role="status"></p>
     <button class="primary" id="start" disabled>شروع ترجمه</button>
     <p class="msg" id="upload-msg" role="status"></p>
   </section>
@@ -185,8 +220,7 @@
   <div id="jobs"></div>
   <p class="empty" id="empty">هنوز فایلی نفرستادید. برای شروع، یک فایل کوتاه (۲-۳ دقیقه) امتحان کنید.</p>
 
-  <footer>ترجمه با سرعت پخش عادی انجام میشه؛ یعنی فایل ۱۰ دقیقه‌ای حدود ۱۰ دقیقه طول می‌کشه.
-    تا وقتی کار تموم نشده، پنجره ترمینال رو نبندید.</footer>
+  <footer>تا وقتی کار تموم نشده، پنجره ترمینال رو نبندید.</footer>
 </main>
 <div class="offline" id="offline" hidden>ارتباط با برنامه قطع شده. پنجره ترمینال هنوز بازه؟</div>
 
@@ -231,10 +265,66 @@ async function loadStatus() {
     keyStatus.textContent = 'کلید API وارد نشده';
   }
   $('#ffmpeg-warn').hidden = s.ffmpeg;
-  $('#model').textContent = s.model;
-  $('#model').dir = 'ltr';
+  models = s.models;
+  fillVoices(s.voices, s.default_voice);
+  showMode();
   updateStart();
 }
+
+// --- translation mode, voice and tone ---
+const GENDER = { female: 'زن', male: 'مرد' };
+const CHARACTER = {
+  firm: 'محکم', warm: 'گرم', breezy: 'سبک و روان', smooth: 'نرم', informative: 'رسمی و آموزشی',
+  friendly: 'دوستانه', upbeat: 'پرانرژی', youthful: 'جوان',
+};
+const STYLE_LABEL = { formal: 'روایی', casual: 'محاوره‌ای' };
+let models = {};
+
+function fillVoices(voices, preferred) {
+  const select = $('#voice');
+  if (select.options.length) return;
+  for (const v of voices) {
+    const option = new Option(`${v.name} — ${GENDER[v.gender] || v.gender}، ${CHARACTER[v.character] || v.character}`, v.name);
+    option.selected = v.name === preferred;
+    select.add(option);
+  }
+}
+const currentMode = () => document.querySelector('input[name=mode]:checked').value;
+function showMode() {
+  const quality = currentMode() === 'quality';
+  document.querySelectorAll('.quality-only').forEach((el) => { el.hidden = !quality; });
+  document.querySelectorAll('.live-only').forEach((el) => { el.hidden = quality; });
+  say($('#sample-msg'), '');
+  const label = quality ? `${models.text} + ${models.tts}` : models.live;
+  $('#model').textContent = label || '';
+  $('#model').dir = 'ltr';
+}
+document.querySelectorAll('input[name=mode]').forEach((r) => r.addEventListener('change', showMode));
+
+let sampleAudio = null;
+$('#sample').addEventListener('click', async () => {
+  const msg = $('#sample-msg');
+  if (!hasKey) {
+    say(msg, 'اول کلید Gemini API رو وارد کنید.', 'error');
+    return;
+  }
+  const params = new URLSearchParams({ voice: $('#voice').value, style: $('#style').value, lang: $('#lang').value });
+  const button = $('#sample');
+  button.disabled = true;
+  say(msg, 'در حال ساخت نمونه صدا…');
+  try {
+    const res = await fetch(`/api/voice-sample?${params}`);
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
+    if (sampleAudio) sampleAudio.pause();
+    sampleAudio = new Audio(URL.createObjectURL(await res.blob()));
+    await sampleAudio.play();
+    say(msg, '');
+  } catch (err) {
+    say(msg, err.message, 'error');
+  } finally {
+    button.disabled = false;
+  }
+});
 
 $('#change-key').addEventListener('click', () => {
   $('#setup').hidden = false;
@@ -304,6 +394,9 @@ drop.addEventListener('drop', (e) => {
 $('#start').addEventListener('click', () => {
   const form = new FormData();
   form.append('lang', $('#lang').value);
+  form.append('mode', currentMode());
+  form.append('voice', $('#voice').value);
+  form.append('style', $('#style').value);
   form.append('save_text', $('#save-text').checked ? '1' : '0');
   for (const f of input.files) form.append('file', f, f.name);
 
@@ -377,6 +470,23 @@ function createCard(job) {
   return { el, loaded: false };
 }
 
+const QUALITY_STEPS = ['transcribe', 'translate', 'speak'];
+function stageText(job) {
+  const count = job.total > 1 ? ` (${fa(job.done)} از ${fa(job.total)})` : '';
+  switch (job.stage) {
+    case 'prepare': return 'آماده‌سازی فایل…';
+    case 'transcribe': return `مرحله ۱ از ۳: تبدیل گفتار به متن${count}`;
+    case 'translate': return `مرحله ۲ از ۳: ترجمه متن${count}`;
+    case 'speak': return `مرحله ۳ از ۳: ساخت صدای ترجمه${count}`;
+    case 'live': {
+      if (job.fraction >= 1) return 'دریافت آخرین بخش ترجمه…';
+      const segments = job.total > 1 ? `، ${fa(job.done)} از ${fa(job.total)} تکه تمام شده` : '';
+      return `ترجمه ${fa(Math.floor(job.fraction * 100))}٪${segments}`;
+    }
+    default: return '';
+  }
+}
+
 function updateCard(card, job) {
   const { el } = card;
   const running = job.status === 'running';
@@ -385,18 +495,18 @@ function updateCard(card, job) {
   badge.className = `badge ${job.status}`;
 
   const bar = $('.bar', el);
+  const step = QUALITY_STEPS.indexOf(job.stage);
+  const overall = step >= 0 ? (step + job.fraction) / QUALITY_STEPS.length : job.fraction;
   bar.hidden = !running;
-  bar.classList.toggle('waiting', running && (job.duration === 0 || job.fraction >= 1));
-  $('.fill', bar).style.width = `${Math.round(job.fraction * 100)}%`;
+  bar.classList.toggle('waiting', running && (job.stage === 'prepare' || (job.stage === 'live' && job.fraction >= 1)));
+  $('.fill', bar).style.width = `${Math.round(overall * 100)}%`;
 
   const parts = [];
-  if (running) {
-    if (job.duration === 0) parts.push('آماده‌سازی فایل…');
-    else if (job.fraction < 1) parts.push(`ترجمه ${fa(Math.floor(job.fraction * 100))}٪`);
-    else parts.push('دریافت آخرین بخش ترجمه…');
-  }
+  if (running) parts.push(stageText(job));
+  parts.push(job.mode === 'quality'
+    ? `کیفیت بالا، صدای ${job.voice}، ${STYLE_LABEL[job.style] || job.style}`
+    : 'ترجمه زنده');
   if (job.duration) parts.push(`مدت فایل ${clock(job.duration)}`);
-  if (running && job.segments > 1) parts.push(`${fa(job.segments_done)} از ${fa(job.segments)} تکه تمام شده`);
   parts.push(`${running ? 'زمان سپری‌شده' : 'زمان کل'} ${clock(job.elapsed)}`);
   // Persian zero (۰) looks like a middle dot, so separate with the Persian comma.
   $('.job-meta', el).textContent = parts.join('، ');

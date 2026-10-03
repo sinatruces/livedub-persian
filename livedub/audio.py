@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import io
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -76,21 +78,43 @@ def split_points(
     return bounds
 
 
+def wav_bytes(pcm: bytes, rate: int) -> bytes:
+    """Wrap 16-bit mono PCM in a WAV container."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(SAMPLE_WIDTH)
+        w.setframerate(rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+def read_wav(data: bytes) -> tuple[bytes, int]:
+    """Return (16-bit mono PCM, sample rate) from WAV bytes."""
+    with wave.open(io.BytesIO(data)) as w:
+        if w.getnchannels() != 1 or w.getsampwidth() != SAMPLE_WIDTH:
+            raise ValueError("expected 16-bit mono WAV")
+        return w.readframes(w.getnframes()), w.getframerate()
+
+
 def write_wav(path: str | Path, pcm: bytes, rate: int) -> None:
     """Write 16-bit mono PCM to `path`, via a temp file so a crash never leaves a partial WAV."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
-        with os.fdopen(fd, "wb") as f, wave.open(f, "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(SAMPLE_WIDTH)
-            w.setframerate(rate)
-            w.writeframes(pcm)
+        with os.fdopen(fd, "wb") as f:
+            f.write(wav_bytes(pcm, rate))
         os.replace(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+
+
+def rate_from_mime(mime_type: str | None, default: int) -> int:
+    """Sample rate from a MIME type such as "audio/pcm;rate=24000"."""
+    match = re.search(r"rate=(\d+)", mime_type or "")
+    return int(match.group(1)) if match else default
 
 
 def silence(seconds: float, rate: int) -> bytes:

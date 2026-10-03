@@ -1,12 +1,15 @@
-"""A stand-in for genai.Client that behaves like a Live Translate session, for offline tests."""
+"""A stand-in for genai.Client (Live Translate sessions and generate_content), for offline tests."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 from types import SimpleNamespace
 
 from google.genai import errors, types
+
+from livedub.audio import wav_bytes
 
 # One "translated" chunk is 0.1 s of a constant non-zero sample at 24 kHz.
 REPLY_CHUNK = (1000).to_bytes(2, "little", signed=True) * 2400
@@ -77,15 +80,71 @@ class FakeSession:
                 return
 
 
+def _response(*parts: types.Part) -> types.GenerateContentResponse:
+    return types.GenerateContentResponse(
+        candidates=[types.Candidate(content=types.Content(role="model", parts=list(parts)))]
+    )
+
+
+class FakeModels:
+    """Stands in for client.aio.models: transcribes, translates and speaks predictably.
+
+    Transcription returns `paragraphs` sentences per audio part, translation wraps each paragraph
+    in «ترجمه …», and speech is 10 ms of audio per character. `failures` makes the first N calls
+    of a kind ("transcribe", "translate", "speak") fail like an overloaded server.
+    """
+
+    def __init__(self, paragraphs: int = 2, silent: bool = False, wav_tts: bool = False, failures=None):
+        self.paragraphs = paragraphs
+        self.silent = silent
+        self.wav_tts = wav_tts
+        self.failures = dict(failures or {})
+        self.calls: list[SimpleNamespace] = []
+
+    def of(self, kind: str) -> list[SimpleNamespace]:
+        return [c for c in self.calls if c.kind == kind]
+
+    async def generate_content(self, *, model, contents, config=None):
+        if config is not None and config.response_modalities == ["AUDIO"]:
+            kind = "speak"
+        elif isinstance(contents, list):
+            kind = "transcribe"
+        else:
+            kind = "translate"
+        self.calls.append(SimpleNamespace(kind=kind, model=model, contents=contents, config=config))
+        await asyncio.sleep(0)
+        if self.failures.get(kind):
+            self.failures[kind] -= 1
+            raise errors.ServerError(503, {"error": {"message": "The model is overloaded."}})
+
+        if kind == "transcribe":
+            n = len(self.of("transcribe"))
+            paragraphs = [] if self.silent else [f"Part {n} sentence {i}." for i in range(1, self.paragraphs + 1)]
+            return _response(types.Part(text=json.dumps({"paragraphs": paragraphs})))
+        if kind == "translate":
+            request = json.loads(contents)
+            translated = [f"ترجمه «{p}»" for p in request["paragraphs"]]
+            return _response(types.Part(text=json.dumps({"paragraphs": translated}, ensure_ascii=False)))
+
+        text = contents.split("\n\n", 1)[1]  # drop the delivery direction line
+        pcm = REPLY_CHUNK[:2] * (240 * len(text))
+        if self.wav_tts:
+            blob = types.Blob(data=wav_bytes(pcm, 24000), mime_type="audio/wav")
+        else:
+            blob = types.Blob(data=pcm, mime_type="audio/L16;codec=pcm;rate=24000")
+        return _response(types.Part(inline_data=blob))
+
+
 class FakeClient:
     """Hands out a new FakeSession per connect(); the first `fail_first` of them break mid-stream."""
 
-    def __init__(self, fail_first: int = 0, **session_kwargs):
+    def __init__(self, fail_first: int = 0, models: FakeModels | None = None, **session_kwargs):
         self.fail_first = fail_first
         self.session_kwargs = session_kwargs
         self.sessions: list[FakeSession] = []
         self.configs = []
-        self.aio = SimpleNamespace(live=SimpleNamespace(connect=self._connect))
+        self.models = models or FakeModels()
+        self.aio = SimpleNamespace(live=SimpleNamespace(connect=self._connect), models=self.models)
 
     @contextlib.asynccontextmanager
     async def _connect(self, *, model, config):

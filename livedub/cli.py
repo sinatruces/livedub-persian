@@ -9,6 +9,7 @@ import os
 import sys
 from pathlib import Path
 
+from .dubber import DEFAULT_VOICE, STYLES, TEXT_MODEL, TTS_MODEL, VOICES, Dubber, DubOptions
 from .pipeline import collect_jobs, translate_file
 from .translator import DEFAULT_MODEL, Translator
 
@@ -18,26 +19,42 @@ log = logging.getLogger("livedub")
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m livedub",
-        description="Translate the speech in audio/video files with Gemini Live Translate and save it as WAV.",
+        description="Translate the speech in audio/video files with Gemini and save it as WAV.",
     )
     parser.add_argument("inputs", nargs="+", type=Path, help="media files and/or folders (searched recursively)")
     parser.add_argument("-o", "--out-dir", type=Path, default=Path("output"), help="where to write results (default: output)")
     parser.add_argument("-l", "--lang", default="fa", help="target language as a BCP-47 code (default: fa = Persian)")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Live API model (default: {DEFAULT_MODEL})")
-    parser.add_argument("--segment-minutes", type=float, default=5.0,
-                        help="longest piece sent in one session; the API caps sessions at ~15 min (default: 5)")
-    parser.add_argument("-j", "--jobs", type=int, default=1,
-                        help="segments translated in parallel; raises speed and API usage (default: 1)")
-    parser.add_argument("--pace", type=float, default=1.0,
-                        help="streaming speed as a multiple of real time (default: 1.0; higher is experimental)")
-    parser.add_argument("--retries", type=int, default=2, help="retries per segment on errors (default: 2)")
-    parser.add_argument("--save-text", action="store_true", help="also save the source and translated transcripts")
+    parser.add_argument("--mode", choices=("quality", "live"), default="quality",
+                        help="quality: transcribe, translate the whole text, then voice it (default); "
+                             "live: Gemini Live Translate, a real-time interpreter")
+    parser.add_argument("-j", "--jobs", type=int, default=None,
+                        help="requests (quality) or live sessions run at once (default: 4 for quality, 1 for live)")
+    parser.add_argument("--retries", type=int, default=2, help="retries per request on errors (default: 2)")
+
+    quality = parser.add_argument_group("quality mode")
+    quality.add_argument("--voice", default=DEFAULT_VOICE,
+                         help=f"Gemini voice (default: {DEFAULT_VOICE}; e.g. {', '.join(VOICES)})")
+    quality.add_argument("--style", choices=STYLES, default="formal",
+                         help="formal: fluent narration; casual: everyday spoken language (default: formal)")
+    quality.add_argument("--text-model", default=TEXT_MODEL, help=f"transcription/translation model (default: {TEXT_MODEL})")
+    quality.add_argument("--tts-model", default=TTS_MODEL, help=f"voice model (default: {TTS_MODEL})")
+
+    live = parser.add_argument_group("live mode")
+    live.add_argument("--model", default=DEFAULT_MODEL, help=f"Live API model (default: {DEFAULT_MODEL})")
+    live.add_argument("--segment-minutes", type=float, default=5.0,
+                      help="longest piece sent in one session; the API caps sessions at ~15 min (default: 5)")
+    live.add_argument("--pace", type=float, default=1.0,
+                      help="streaming speed as a multiple of real time (default: 1.0; higher is experimental)")
+    live.add_argument("--save-text", action="store_true",
+                      help="also save the transcripts (quality mode always saves them)")
     parser.add_argument("--overwrite", action="store_true", help="redo files whose output already exists")
     parser.add_argument("-v", "--verbose", action="store_true", help="show debug logs")
     args = parser.parse_args(argv)
 
     if args.segment_minutes < 0.5 or args.segment_minutes > 14:
         parser.error("--segment-minutes must be between 0.5 and 14")
+    if args.jobs is None:
+        args.jobs = 4 if args.mode == "quality" else 1
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
     if args.pace <= 0:
@@ -58,19 +75,34 @@ async def run(args: argparse.Namespace, client) -> int:
         log.info("nothing to do")
         return 0
 
-    translator = Translator(client, args.lang, args.model, pace=args.pace, with_text=args.save_text)
-    sessions = asyncio.Semaphore(args.jobs)
+    if args.mode == "quality":
+        dubber = Dubber(client, DubOptions(
+            language=args.lang,
+            voice=args.voice,
+            style=args.style,
+            text_model=args.text_model,
+            tts_model=args.tts_model,
+            parallel=args.jobs,
+            retries=args.retries,
+        ))
+    else:
+        translator = Translator(client, args.lang, args.model, pace=args.pace, with_text=args.save_text)
+        sessions = asyncio.Semaphore(args.jobs)
+
     failed = []
     for job in jobs:
         try:
-            await translate_file(
-                job,
-                translator,
-                segment_seconds=args.segment_minutes * 60,
-                sessions=sessions,
-                retries=args.retries,
-                save_text=args.save_text,
-            )
+            if args.mode == "quality":
+                await dubber.dub_file(job)
+            else:
+                await translate_file(
+                    job,
+                    translator,
+                    segment_seconds=args.segment_minutes * 60,
+                    sessions=sessions,
+                    retries=args.retries,
+                    save_text=args.save_text,
+                )
         except Exception as e:
             log.error("%s: failed: %s: %s", job.source.name, type(e).__name__, e)
             log.debug("details", exc_info=True)

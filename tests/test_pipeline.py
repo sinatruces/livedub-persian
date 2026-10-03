@@ -98,6 +98,28 @@ def test_gives_up_after_retries(tmp_path, monkeypatch):
     assert not job.output.exists()
 
 
+def test_run_all_keeps_the_original_order():
+    async def slow(i):
+        await asyncio.sleep((5 - i) * 0.01)  # later items finish first
+        return i
+
+    assert asyncio.run(pipeline.run_all(slow(i) for i in range(5))) == [0, 1, 2, 3, 4]
+
+
+def test_run_all_cancels_the_rest_on_failure():
+    finished = []
+
+    async def item(i):
+        if i == 0:
+            raise ValueError("boom")
+        await asyncio.sleep(1)
+        finished.append(i)
+
+    with pytest.raises(ValueError, match="boom"):
+        asyncio.run(pipeline.run_all(item(i) for i in range(3)))
+    assert finished == []
+
+
 def test_auth_errors_are_not_retried():
     assert not pipeline._retryable(errors.ClientError(403, {"error": {"message": "bad key"}}))
     assert pipeline._retryable(errors.ClientError(429, {"error": {"message": "quota"}}))
@@ -122,13 +144,27 @@ def test_cli_skips_finished_files_and_reports_failures(tmp_path, monkeypatch):
     out.mkdir()
     (out / "done.fa.wav").write_bytes(b"keep me")
 
-    args = cli.parse_args([str(tmp_path / "in"), "-o", str(out), "--pace", "100"])
+    args = cli.parse_args([str(tmp_path / "in"), "-o", str(out), "--mode", "live", "--pace", "100"])
     client = FakeClient(on_end="close")
     assert asyncio.run(cli.run(args, client)) == 1  # broken.mp3 fails to decode
 
     assert (out / "done.fa.wav").read_bytes() == b"keep me"
     assert wav_frames(out / "new.fa.wav") > 0
     assert len(client.sessions) == 1
+
+
+@needs_ffmpeg
+def test_cli_quality_mode(tmp_path):
+    make_wav(tmp_path / "talk.wav", 3)
+    out = tmp_path / "out"
+    args = cli.parse_args([str(tmp_path / "talk.wav"), "-o", str(out), "--voice", "Puck", "--style", "casual"])
+    assert (args.mode, args.jobs) == ("quality", 4)
+    client = FakeClient()
+    assert asyncio.run(cli.run(args, client)) == 0
+    assert wav_frames(out / "talk.fa.wav") > 0
+    assert (out / "talk.fa.txt").read_text(encoding="utf-8").startswith("ترجمه")
+    assert client.models.of("speak")[0].config.speech_config.voice_config.prebuilt_voice_config.voice_name == "Puck"
+    assert not client.sessions
 
 
 def test_cli_needs_an_api_key(monkeypatch, tmp_path):

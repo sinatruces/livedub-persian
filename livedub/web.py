@@ -21,7 +21,8 @@ from aiohttp import web
 from google.genai import errors
 
 from .audio import MEDIA_EXTENSIONS
-from .pipeline import Job, Progress, translate_file
+from .dubber import DEFAULT_VOICE, STYLES, TEXT_MODEL, TTS_MODEL, VOICES, Dubber, DubOptions
+from .pipeline import Job, Progress, transcript_paths, translate_file
 from .translator import DEFAULT_MODEL, Translator
 
 log = logging.getLogger("livedub.web")
@@ -30,6 +31,8 @@ STATIC_DIR = Path(__file__).with_name("static")
 SEGMENT_SECONDS = 300
 MAX_UPLOAD_BYTES = 4 * 1024**3
 LANG_RE = re.compile(r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$")
+VOICE_RE = re.compile(r"^[A-Za-z]{2,30}$")
+MODES = ("quality", "live")
 
 
 class InvalidKey(Exception):
@@ -88,6 +91,9 @@ class WebJob:
     save_text: bool
     dir: Path
     source: Path
+    mode: str = "quality"  # quality | live
+    voice: str = DEFAULT_VOICE
+    style: str = "formal"
     created: float = field(default_factory=time.time)
     status: str = "running"  # running | done | error | cancelled
     error: str = ""
@@ -101,7 +107,7 @@ class WebJob:
 
     @property
     def text_file(self) -> Path:
-        return self.output.with_suffix(".txt")
+        return transcript_paths(self.output)[0]
 
     @property
     def download_stem(self) -> str:
@@ -113,11 +119,15 @@ class WebJob:
             "id": self.id,
             "name": self.name,
             "lang": self.lang,
+            "mode": self.mode,
+            "voice": self.voice if self.mode == "quality" else None,
+            "style": self.style if self.mode == "quality" else None,
             "status": self.status,
             "error": self.error,
             "duration": round(self.progress.duration, 1),
-            "segments": self.progress.segments,
-            "segments_done": self.progress.segments_done,
+            "stage": self.progress.stage,
+            "done": self.progress.done,
+            "total": self.progress.total,
             "fraction": round(self.progress.fraction, 4),
             "elapsed": round((self.finished or time.time()) - self.created, 1),
             "audio_url": f"/api/jobs/{self.id}/audio" if done else None,
@@ -135,8 +145,10 @@ class WebApp:
         make_client: Callable[[str], object],
         check_key: Callable[[object, str], Awaitable[str | None]] = check_key,
         env_file: Path | None = None,
-        model: str = DEFAULT_MODEL,
-        jobs: int = 2,
+        live_model: str = DEFAULT_MODEL,
+        text_model: str = TEXT_MODEL,
+        tts_model: str = TTS_MODEL,
+        parallel: int = 3,
         retries: int = 2,
         translator_options: dict | None = None,
     ):
@@ -144,13 +156,17 @@ class WebApp:
         self.make_client = make_client
         self.check_key = check_key
         self.env_file = env_file
-        self.model = model
+        self.live_model = live_model
+        self.text_model = text_model
+        self.tts_model = tts_model
+        self.parallel = parallel
         self.retries = retries
         self.translator_options = translator_options or {}
         self.api_key = api_key
         self.client = make_client(api_key) if api_key else None
-        self.sessions = asyncio.Semaphore(jobs)
+        self.sessions = asyncio.Semaphore(parallel)
         self.jobs: dict[str, WebJob] = {}
+        self.samples: dict[tuple[str, str, str], bytes] = {}  # voice samples by (voice, lang, style)
 
     def build(self) -> web.Application:
         app = web.Application()
@@ -158,6 +174,7 @@ class WebApp:
             web.get("/", self.index),
             web.get("/api/status", self.status),
             web.post("/api/key", self.set_key),
+            web.get("/api/voice-sample", self.voice_sample),
             web.get("/api/jobs", self.list_jobs),
             web.post("/api/jobs", self.create_jobs),
             web.post("/api/jobs/{id}/cancel", self.cancel_job),
@@ -179,7 +196,10 @@ class WebApp:
             "has_key": self.client is not None,
             "key_hint": self.api_key[-4:] if self.api_key else None,
             "ffmpeg": shutil.which("ffmpeg") is not None,
-            "model": self.model,
+            "models": {"live": self.live_model, "text": self.text_model, "tts": self.tts_model},
+            "voices": [{"name": n, "gender": g, "character": c} for n, (g, c) in VOICES.items()],
+            "default_voice": DEFAULT_VOICE,
+            "styles": list(STYLES),
         })
 
     async def set_key(self, request: web.Request) -> web.Response:
@@ -191,10 +211,11 @@ class WebApp:
             return _error(400, "کلید خالیه.")
         client = self.make_client(key)
         try:
-            warning = await self.check_key(client, self.model)
+            warning = await self.check_key(client, self.text_model)
         except InvalidKey as e:
             return _error(400, str(e))
         self.api_key, self.client = key, client
+        self.samples.clear()
         if self.env_file:
             save_env_key(self.env_file, key)
         log.info("API key updated")
@@ -211,34 +232,49 @@ class WebApp:
             return _error(400, "اول کلید Gemini API رو وارد کنید.")
         if not request.content_type.startswith("multipart/"):
             return _error(400, "هیچ فایلی انتخاب نشده.")
-        lang, save_text, uploads = "fa", False, []
+        fields: dict[str, str] = {}
+        uploads: list[tuple[str, Path, Path]] = []
         try:
             reader = await request.multipart()
             async for part in reader:
-                if part.name == "lang":
-                    lang = (await part.text()).strip() or "fa"
-                elif part.name == "save_text":
-                    save_text = (await part.text()).strip().lower() in ("1", "true", "on")
-                elif part.name == "file" and part.filename:
+                if part.name == "file" and part.filename:
                     uploads.append(await self._store_upload(part))
+                elif part.name:
+                    fields[part.name] = (await part.text()).strip()
+            settings = self._job_settings(fields)
         except ValueError as e:
             for _, folder, _ in uploads:
                 shutil.rmtree(folder, ignore_errors=True)
             return _error(400, str(e))
-        if not LANG_RE.match(lang):
-            for _, folder, _ in uploads:
-                shutil.rmtree(folder, ignore_errors=True)
-            return _error(400, f"کد زبان نامعتبره: {lang}")
         if not uploads:
             return _error(400, "هیچ فایلی انتخاب نشده.")
 
         created = []
         for name, folder, source in uploads:
-            job = WebJob(folder.name, name, lang, save_text, folder, source)
+            job = WebJob(folder.name, name, source=source, dir=folder, **settings)
             self.jobs[job.id] = job
             job.task = asyncio.create_task(self._run(job))
             created.append(job.to_json())
         return web.json_response(created, status=201)
+
+    @staticmethod
+    def _job_settings(fields: dict[str, str]) -> dict:
+        settings = {
+            "lang": fields.get("lang") or "fa",
+            "mode": fields.get("mode") or "quality",
+            "voice": fields.get("voice") or DEFAULT_VOICE,
+            "style": fields.get("style") or "formal",
+            "save_text": fields.get("save_text", "").lower() in ("1", "true", "on"),
+        }
+        if not LANG_RE.match(settings["lang"]):
+            raise ValueError(f"کد زبان نامعتبره: {settings['lang']}")
+        if settings["mode"] not in MODES:
+            raise ValueError(f"حالت نامعتبره: {settings['mode']}")
+        if not VOICE_RE.match(settings["voice"]):
+            raise ValueError(f"اسم صدا نامعتبره: {settings['voice']}")
+        if settings["style"] not in STYLES:
+            raise ValueError(f"لحن نامعتبره: {settings['style']}")
+        return settings
 
     async def _store_upload(self, part) -> tuple[str, Path, Path]:
         name = PureWindowsPath(part.filename).name  # strips folders from both / and \ paths
@@ -262,20 +298,38 @@ class WebApp:
         log.info("%s: uploaded (%.1f MB)", name, size / 1e6)
         return name, folder, source
 
-    async def _run(self, job: WebJob) -> None:
-        translator = Translator(
-            self.client, job.lang, self.model, with_text=job.save_text, **self.translator_options
+    def _dubber(self, lang: str, voice: str, style: str) -> Dubber:
+        options = DubOptions(
+            language=lang,
+            voice=voice,
+            style=style,
+            text_model=self.text_model,
+            tts_model=self.tts_model,
+            parallel=self.parallel,
+            retries=self.retries,
         )
+        return Dubber(self.client, options)
+
+    async def _translate(self, job: WebJob) -> None:
+        if job.mode == "quality":
+            await self._dubber(job.lang, job.voice, job.style).dub_file(Job(job.source, job.output), job.progress)
+            return
+        translator = Translator(
+            self.client, job.lang, self.live_model, with_text=job.save_text, **self.translator_options
+        )
+        await translate_file(
+            Job(job.source, job.output),
+            translator,
+            segment_seconds=SEGMENT_SECONDS,
+            sessions=self.sessions,
+            retries=self.retries,
+            save_text=job.save_text,
+            progress=job.progress,
+        )
+
+    async def _run(self, job: WebJob) -> None:
         try:
-            await translate_file(
-                Job(job.source, job.output),
-                translator,
-                segment_seconds=SEGMENT_SECONDS,
-                sessions=self.sessions,
-                retries=self.retries,
-                save_text=job.save_text,
-                progress=job.progress,
-            )
+            await self._translate(job)
             job.status = "done"
         except asyncio.CancelledError:
             job.status = "cancelled"
@@ -291,6 +345,24 @@ class WebApp:
         if job is None:
             raise web.HTTPNotFound()
         return job
+
+    async def voice_sample(self, request: web.Request) -> web.Response:
+        if self.client is None:
+            return _error(400, "اول کلید Gemini API رو وارد کنید.")
+        q = request.query
+        try:
+            settings = self._job_settings({"lang": q.get("lang", ""), "voice": q.get("voice", ""), "style": q.get("style", "")})
+        except ValueError as e:
+            return _error(400, str(e))
+        key = (settings["voice"], settings["lang"], settings["style"])
+        if key not in self.samples:
+            try:
+                dubber = self._dubber(settings["lang"], settings["voice"], settings["style"])
+                self.samples[key] = await dubber.preview()
+            except Exception as e:
+                log.error("voice sample failed: %s: %s", type(e).__name__, e)
+                return _error(502, f"ساخت نمونه صدا ناموفق بود: {e}")
+        return web.Response(body=self.samples[key], content_type="audio/wav")
 
     async def cancel_job(self, request: web.Request) -> web.Response:
         job = self._job(request)
@@ -346,13 +418,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1", help="address to listen on (default: 127.0.0.1, this computer only)")
     parser.add_argument("--port", type=int, default=8000, help="port (default: 8000)")
     parser.add_argument("--data-dir", type=Path, default=Path("web_data"), help="where uploads and results are kept")
-    parser.add_argument("-j", "--jobs", type=int, default=2, help="segments translated in parallel (default: 2)")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Live API model (default: {DEFAULT_MODEL})")
+    parser.add_argument("-j", "--parallel", type=int, default=3, help="requests or live sessions run at once (default: 3)")
+    parser.add_argument("--text-model", default=TEXT_MODEL, help=f"transcription/translation model (default: {TEXT_MODEL})")
+    parser.add_argument("--tts-model", default=TTS_MODEL, help=f"voice model (default: {TTS_MODEL})")
+    parser.add_argument("--live-model", default=DEFAULT_MODEL, help=f"live mode model (default: {DEFAULT_MODEL})")
     parser.add_argument("--open", action="store_true", help="open the page in the browser once the server is up")
     parser.add_argument("-v", "--verbose", action="store_true", help="show debug logs")
     args = parser.parse_args(argv)
-    if args.jobs < 1:
-        parser.error("--jobs must be at least 1")
+    if args.parallel < 1:
+        parser.error("--parallel must be at least 1")
     return args
 
 
@@ -373,7 +447,8 @@ def main(argv: list[str] | None = None) -> int:
         return genai.Client(api_key=key, http_options={"api_version": "v1beta"})
 
     app = WebApp(args.data_dir, api_key=api_key, make_client=make_client, env_file=env_file,
-                 model=args.model, jobs=args.jobs).build()
+                 live_model=args.live_model, text_model=args.text_model, tts_model=args.tts_model,
+                 parallel=args.parallel).build()
     url = f"http://{'localhost' if args.host in ('127.0.0.1', 'localhost') else args.host}:{args.port}"
 
     async def announce(_app: web.Application) -> None:

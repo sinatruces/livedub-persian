@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from google.genai import errors, types
 
-from .audio import INPUT_RATE, OUTPUT_RATE, SAMPLE_WIDTH, silence
+from .audio import INPUT_RATE, OUTPUT_RATE, SAMPLE_WIDTH, rate_from_mime, silence
 
 log = logging.getLogger(__name__)
 
@@ -44,11 +43,6 @@ def build_config(target_language: str, with_text: bool = False) -> types.LiveCon
     )
 
 
-def _rate_from_mime(mime_type: str | None, default: int) -> int:
-    match = re.search(r"rate=(\d+)", mime_type or "")
-    return int(match.group(1)) if match else default
-
-
 @dataclass
 class _Collector:
     chunks: list[bytes] = field(default_factory=list)
@@ -78,7 +72,7 @@ class _Collector:
             for part in content.model_turn.parts:
                 blob = part.inline_data
                 if blob and blob.data:
-                    self.rate = _rate_from_mime(blob.mime_type, self.rate)
+                    self.rate = rate_from_mime(blob.mime_type, self.rate)
                     self.chunks.append(blob.data)
         if content.output_transcription and content.output_transcription.text:
             self.translated.append(content.output_transcription.text)

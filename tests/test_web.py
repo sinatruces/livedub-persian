@@ -9,7 +9,7 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from livedub.web import InvalidKey, WebApp, load_env_key, save_env_key
-from tests.fakes import FakeClient
+from tests.fakes import FakeClient, FakeModels
 from tests.test_pipeline import make_wav
 
 needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
@@ -41,10 +41,13 @@ def run(app, scenario):
     return asyncio.run(go())
 
 
-def upload_form(*paths, lang="fa", save_text=False):
+def upload_form(*paths, lang="fa", save_text=False, mode="live", **fields):
     form = aiohttp.FormData(quote_fields=False)  # send UTF-8 file names raw, like browsers do
     form.add_field("lang", lang)
+    form.add_field("mode", mode)
     form.add_field("save_text", "1" if save_text else "0")
+    for name, value in fields.items():
+        form.add_field(name, value)
     for path in paths:
         form.add_field("file", Path(path).read_bytes(), filename=Path(path).name)
     return form
@@ -69,6 +72,9 @@ def test_page_and_status(tmp_path):
         assert page.status == 200 and "livedub" in await page.text()
         status = await (await client.get("/api/status")).json()
         assert status["has_key"] is False and status["key_hint"] is None
+        assert status["models"]["tts"] == "gemini-3.8-flash-tts"
+        assert {"name": "Kore", "gender": "female", "character": "firm"} in status["voices"]
+        assert (await client.get("/api/voice-sample?voice=Kore")).status == 400
         refused = await client.post("/api/jobs", data=upload_form())
         assert refused.status == 400
 
@@ -175,6 +181,8 @@ def test_rejects_unsupported_files_and_languages(tmp_path):
         assert bad_type.status == 400 and ".txt" in (await bad_type.json())["error"]
         bad_lang = await client.post("/api/jobs", data=upload_form(clip, lang="fa;rm -rf"))
         assert bad_lang.status == 400
+        for field in ({"mode": "fast"}, {"style": "loud"}, {"voice": "../x"}):
+            assert (await client.post("/api/jobs", data=upload_form(clip, **field))).status == 400
         assert (await client.post("/api/jobs", data=upload_form())).status == 400
         assert await (await client.get("/api/jobs")).json() == []
 
@@ -197,5 +205,55 @@ def test_cancel_and_delete(tmp_path):
         assert (await client.delete(f"/api/jobs/{job['id']}")).status == 200
         assert not folder.exists()
         assert (await client.get(f"/api/jobs/{job['id']}/audio")).status == 404
+
+    run(app, scenario)
+
+
+@needs_ffmpeg
+def test_quality_job(tmp_path, monkeypatch):
+    monkeypatch.setattr("livedub.pipeline.RETRY_BASE_SECONDS", 0.01)
+    app, fake = make_app(tmp_path)
+    src = make_wav(tmp_path / "talk.wav", 3)
+
+    async def scenario(client):
+        form = upload_form(src, mode="quality", voice="Charon", style="casual")
+        [job] = await (await client.post("/api/jobs", data=form)).json()
+        assert (job["mode"], job["voice"], job["style"]) == ("quality", "Charon", "casual")
+        job = await wait_for(client, job["id"])
+        assert job["status"] == "done", job["error"]
+        assert (job["stage"], job["done"]) == ("speak", job["total"])
+        assert job["text_url"]  # quality mode always keeps the transcript
+        text = await (await client.get(job["text_url"])).text()
+        assert text.startswith("ترجمه «Part 1 sentence 1.»")
+        audio = await client.get(job["audio_url"])
+        assert (await audio.read())[:4] == b"RIFF"
+
+    run(app, scenario)
+    speak = fake.models.of("speak")
+    assert speak[0].config.speech_config.voice_config.prebuilt_voice_config.voice_name == "Charon"
+    assert not fake.sessions
+
+
+def test_voice_sample_is_cached(tmp_path):
+    app, fake = make_app(tmp_path)
+
+    async def scenario(client):
+        for _ in range(2):
+            res = await client.get("/api/voice-sample?voice=Sulafat&lang=fa&style=formal")
+            assert res.status == 200 and res.content_type == "audio/wav"
+            assert (await res.read())[:4] == b"RIFF"
+        assert (await client.get("/api/voice-sample?voice=Sulafat&lang=fa&style=nope")).status == 400
+
+    run(app, scenario)
+    assert len(fake.models.of("speak")) == 1
+
+
+def test_voice_sample_failure_is_reported(tmp_path, monkeypatch):
+    monkeypatch.setattr("livedub.pipeline.RETRY_BASE_SECONDS", 0.01)
+    app, _ = make_app(tmp_path, fake=FakeClient(models=FakeModels(failures={"speak": 5})), retries=1)
+
+    async def scenario(client):
+        res = await client.get("/api/voice-sample?voice=Kore&lang=fa&style=formal")
+        assert res.status == 502 and "overloaded" in (await res.json())["error"]
 
     run(app, scenario)
