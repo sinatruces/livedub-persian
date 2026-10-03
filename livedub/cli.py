@@ -6,11 +6,12 @@ import argparse
 import asyncio
 import logging
 import os
+import shutil
 import sys
 from pathlib import Path
 
 from .dubber import DEFAULT_VOICE, STYLES, TEXT_MODEL, TTS_MODEL, VOICES, Dubber, DubOptions
-from .pipeline import collect_jobs, translate_file
+from .pipeline import collect_jobs, friendly_error, translate_file
 from .translator import DEFAULT_MODEL, Translator
 
 log = logging.getLogger("livedub")
@@ -93,7 +94,10 @@ async def run(args: argparse.Namespace, client) -> int:
     for job in jobs:
         try:
             if args.mode == "quality":
-                await dubber.dub_file(job)
+                # Finished steps are kept here, so a re-run after an error picks up where it stopped.
+                work_dir = job.output.parent / f".{job.output.name}.parts"
+                await dubber.dub_file(job, work_dir=work_dir)
+                shutil.rmtree(work_dir, ignore_errors=True)
             else:
                 await translate_file(
                     job,
@@ -105,11 +109,15 @@ async def run(args: argparse.Namespace, client) -> int:
                 )
         except Exception as e:
             log.error("%s: failed: %s: %s", job.source.name, type(e).__name__, e)
+            if hint := friendly_error(e):
+                log.error("%s", hint)
             log.debug("details", exc_info=True)
             failed.append(job)
 
     done = len(jobs) - len(failed)
     log.info("finished: %d translated, %d failed", done, len(failed))
+    if failed and args.mode == "quality":
+        log.info("run the same command again to continue the failed files where they stopped")
     return 1 if failed else 0
 
 

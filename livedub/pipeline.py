@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,6 +31,12 @@ T = TypeVar("T")
 SEGMENT_GAP_SECONDS = 0.3
 # Retries wait 2, 4, 8... seconds.
 RETRY_BASE_SECONDS = 2
+# A rate limit asking us to wait longer than this is treated as "out of quota for now".
+MAX_RATE_LIMIT_WAIT = 120
+# How many times we wait out a short rate limit before giving up.
+MAX_RATE_LIMIT_WAITS = 8
+# Added to the server's suggested wait, so the retry lands safely after it.
+RATE_LIMIT_PADDING = 1
 
 
 @dataclass
@@ -81,23 +88,97 @@ def collect_jobs(inputs: list[Path], out_dir: Path, language: str) -> list[Job]:
     return jobs
 
 
+class QuotaExhausted(Exception):
+    """The API refused a request because a quota is used up and will not refill soon."""
+
+    def __init__(self, model: str | None, wait_seconds: float | None, per_day: bool, cause: Exception):
+        self.model, self.wait_seconds, self.per_day = model, wait_seconds, per_day
+        when = f"retry in about {wait_seconds / 3600:.1f} h" if wait_seconds else "retry later"
+        scope = "daily quota" if per_day else "quota"
+        super().__init__(f"{scope} of {model or 'the model'} is used up; {when}. ({cause})")
+
+
+def _error_body(exc: errors.APIError) -> dict:
+    body = exc.details if isinstance(exc.details, dict) else {}
+    return body.get("error", body) if isinstance(body.get("error", body), dict) else {}
+
+
+def quota_wait(exc: errors.APIError) -> float | None:
+    """Seconds the server asked us to wait before retrying, if it said."""
+    for detail in _error_body(exc).get("details") or []:
+        delay = str(detail.get("retryDelay", "")) if isinstance(detail, dict) else ""
+        if match := re.fullmatch(r"([\d.]+)s", delay):
+            return float(match.group(1))
+    return None
+
+
+def _quota_scope(exc: errors.APIError) -> tuple[str | None, bool]:
+    """(model, whether the exhausted quota is a per-day one) from a 429 error."""
+    for detail in _error_body(exc).get("details") or []:
+        for violation in (detail.get("violations") or []) if isinstance(detail, dict) else []:
+            model = (violation.get("quotaDimensions") or {}).get("model")
+            return model, "PerDay" in str(violation.get("quotaId", ""))
+    return None, False
+
+
 def _retryable(exc: Exception) -> bool:
-    # Bad requests, keys or model names will not fix themselves; quota errors (429) might.
-    return not (isinstance(exc, errors.ClientError) and exc.code != 429)
+    # Bad requests, keys or model names will not fix themselves.
+    return not isinstance(exc, (errors.ClientError, QuotaExhausted))
 
 
 async def retry(call: Callable[[], Awaitable[T]], retries: int, label: str) -> T:
-    """Await `call()`, retrying transient failures with exponential backoff."""
-    for attempt in range(retries + 1):
+    """Await `call()`, retrying transient failures with exponential backoff.
+
+    Rate limits (HTTP 429) are waited out as the server asks, without using up `retries`;
+    a quota that will not refill within MAX_RATE_LIMIT_WAIT raises QuotaExhausted at once.
+    """
+    attempt = rate_waits = 0
+    while True:
         try:
             return await call()
+        except errors.ClientError as e:
+            if e.code != 429:
+                raise
+            wait = quota_wait(e)
+            model, per_day = _quota_scope(e)
+            if per_day or (wait or 0) > MAX_RATE_LIMIT_WAIT or rate_waits >= MAX_RATE_LIMIT_WAITS:
+                raise QuotaExhausted(model, wait, per_day, e) from e
+            rate_waits += 1
+            wait = wait if wait is not None else 30
+            log.warning("%s: rate limited; waiting %.0fs as the server asked", label, wait)
+            await asyncio.sleep(wait + RATE_LIMIT_PADDING)
         except Exception as e:
-            if attempt == retries or not _retryable(e):
+            if attempt >= retries or not _retryable(e):
                 raise
             wait = RETRY_BASE_SECONDS * 2**attempt
+            attempt += 1
             log.warning("%s failed (%s: %s); retrying in %gs", label, type(e).__name__, e, wait)
             await asyncio.sleep(wait)
-    raise AssertionError("unreachable")
+
+
+_FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+
+
+def friendly_error(exc: BaseException) -> str | None:
+    """A short Persian explanation of errors people can act on, or None."""
+    if isinstance(exc, QuotaExhausted):
+        model = exc.model or "این مدل"
+        scope = "سهمیه‌ی رایگان روزانه‌ی" if exc.per_day else "سهمیه‌ی"
+        when = ""
+        if exc.wait_seconds:
+            hours, minutes = divmod(int(exc.wait_seconds // 60), 60)
+            h, m = str(hours).translate(_FA_DIGITS), str(minutes + (0 if hours else 1)).translate(_FA_DIGITS)
+            when = f"حدود {h} ساعت و {m} دقیقه‌ی دیگه " if hours else f"حدود {m} دقیقه‌ی دیگه "
+        return (
+            f"{scope} {model} تموم شده. {when}دوباره امتحان کنید؛ برای کار نیمه‌تموم دکمه‌ی «ادامه» رو بزنید "
+            "تا از همون‌جا ادامه پیدا کنه و قسمت‌های انجام‌شده تکرار نشن. برای محدودیت بیشتر، در Google AI "
+            "Studio برای پروژه‌ی کلیدتون پرداخت (billing) رو فعال کنید."
+        )
+    if isinstance(exc, errors.ClientError) and exc.code == 404:
+        return "مدل پیدا نشد یا برای کلید شما فعال نیست. اسم مدل رو بررسی کنید."
+    if isinstance(exc, errors.ClientError) and exc.code in (401, 403):
+        return "گوگل اجازه‌ی این درخواست رو نداد؛ کلید API رو بررسی کنید."
+    return None
 
 
 async def run_all(coros: Iterable[Awaitable[T]]) -> list[T]:

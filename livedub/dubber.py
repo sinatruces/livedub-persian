@@ -8,10 +8,14 @@ how the result will be read aloud, and the voice is a studio TTS voice you pick.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import os
 import re
+import wave
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 from google.genai import types
@@ -22,6 +26,7 @@ from .audio import (
     OUTPUT_RATE,
     SAMPLE_WIDTH,
     decode_to_pcm16,
+    encode_mp3,
     rate_from_mime,
     read_wav,
     silence,
@@ -59,9 +64,11 @@ LANGUAGES = {
     "es": "Spanish",
 }
 
-TRANSCRIBE_SECONDS = 300  # audio per transcription request
-TRANSLATE_WORDS = 2500  # source words per translation request
-SPEAK_CHARS = 600  # characters per TTS request
+# Large pieces keep the request count low, which matters on the free tier (about 20 requests a day
+# per model): an hour of audio takes 2 transcription and 1-2 translation requests.
+TRANSCRIBE_SECONDS = 1800  # audio per transcription request (30 min of 32 kbit/s MP3 is about 7 MB)
+TRANSLATE_WORDS = 6000  # source words per translation request
+SPEAK_CHARS = 2000  # characters per TTS request, roughly two minutes of speech
 CONTEXT_PARAGRAPHS = 3  # earlier paragraphs the translator sees for continuity
 PIECE_GAP_SECONDS = 0.35  # pause between separately voiced pieces
 NO_TOOLS = types.AutomaticFunctionCallingConfig(disable=True)
@@ -86,6 +93,44 @@ SAMPLE_TEXT = {
 
 class _Paragraphs(BaseModel):
     paragraphs: list[str]
+
+
+class WorkDir:
+    """Keeps each finished step of a file on disk, so a re-run continues where the last one stopped.
+
+    With no path nothing is kept and every run starts from scratch.
+    """
+
+    def __init__(self, path: Path | None):
+        self.path = path
+        if path:
+            path.mkdir(parents=True, exist_ok=True)
+
+    def load(self, name: str):
+        if not self.path:
+            return None
+        try:
+            return json.loads((self.path / name).read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError):
+            return None
+
+    def save(self, name: str, data) -> None:
+        if self.path:
+            tmp = self.path / f".{name}.tmp"
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, self.path / name)
+
+    def load_audio(self, name: str) -> tuple[bytes, int] | None:
+        if not self.path:
+            return None
+        try:
+            return read_wav((self.path / name).read_bytes())
+        except (FileNotFoundError, EOFError, ValueError, wave.Error):
+            return None
+
+    def save_audio(self, name: str, pcm: bytes, rate: int) -> None:
+        if self.path:
+            write_wav(self.path / name, pcm, rate)
 
 
 def translation_instructions(language: str, style: str) -> str:
@@ -216,8 +261,8 @@ class Dubber:
             parsed = _Paragraphs.model_validate_json(response.text or "")
         return [p.strip() for p in parsed.paragraphs if p.strip()]
 
-    async def transcribe(self, pcm: bytes) -> list[str]:
-        audio = types.Part.from_bytes(data=wav_bytes(pcm, INPUT_RATE), mime_type="audio/wav")
+    async def transcribe(self, mp3: bytes) -> list[str]:
+        audio = types.Part.from_bytes(data=mp3, mime_type="audio/mpeg")
         return await self._paragraphs([audio, TRANSCRIBE_PROMPT])
 
     async def translate(self, paragraphs: list[str], previous_source: list[str], previous_translation: list[str]) -> list[str]:
@@ -259,9 +304,14 @@ class Dubber:
         pcm, rate = await retry(lambda: self.speak(text), o.retries, f"voice sample {o.voice}")
         return wav_bytes(pcm, rate)
 
-    async def dub_file(self, job: Job, progress: Progress | None = None) -> None:
-        """Translate and voice `job.source`, writing the WAV and both transcripts next to `job.output`."""
+    async def dub_file(self, job: Job, progress: Progress | None = None, work_dir: Path | None = None) -> None:
+        """Translate and voice `job.source`, writing the WAV and both transcripts next to `job.output`.
+
+        Finished steps are kept in `work_dir` (if given), so after an error, such as a used-up
+        quota, running again only redoes what is missing.
+        """
         progress = progress or Progress()
+        work = WorkDir(work_dir)
         o = self.options
         name = job.source.name
         limit = asyncio.Semaphore(o.parallel)
@@ -275,9 +325,13 @@ class Dubber:
         progress.start("transcribe", len(bounds))
 
         async def transcribe(i: int, start: int, end: int) -> list[str]:
-            async with limit:
-                chunk = samples[start:end].tobytes()
-                result = await retry(lambda: self.transcribe(chunk), o.retries, f"{name}: transcribing part {i + 1}")
+            key = f"transcript-{start}-{end}.json"
+            result = work.load(key)
+            if result is None:
+                async with limit:
+                    mp3 = await asyncio.to_thread(encode_mp3, samples[start:end].tobytes(), INPUT_RATE)
+                    result = await retry(lambda: self.transcribe(mp3), o.retries, f"{name}: transcribing part {i + 1}")
+                work.save(key, result)
             progress.done += 1
             return result
 
@@ -288,13 +342,20 @@ class Dubber:
 
         # Batches run in order so each one sees how the previous one was translated.
         batches = batch_by_words(source, TRANSLATE_WORDS)
+        key = f"translation-{_slug(o.language)}-{o.style}.json"
+        saved = work.load(key) or []
         progress.start("translate", len(batches))
         log.info("%s: translating %d paragraph(s)", name, len(source))
         translated: list[str] = []
         done_source: list[str] = []
         for i, batch in enumerate(batches):
-            previous = (done_source[-CONTEXT_PARAGRAPHS:], translated[-CONTEXT_PARAGRAPHS:])
-            result = await retry(lambda: self.translate(batch, *previous), o.retries, f"{name}: translating part {i + 1}")
+            if i < len(saved) and saved[i]["source"] == batch:
+                result = saved[i]["translation"]
+            else:
+                previous = (done_source[-CONTEXT_PARAGRAPHS:], translated[-CONTEXT_PARAGRAPHS:])
+                result = await retry(lambda: self.translate(batch, *previous), o.retries, f"{name}: translating part {i + 1}")
+                saved = saved[:i] + [{"source": batch, "translation": result}]
+                work.save(key, saved)
             translated += result
             done_source += batch
             progress.done += 1
@@ -304,8 +365,17 @@ class Dubber:
         log.info("%s: voicing %d piece(s) with %s", name, len(pieces), o.voice)
 
         async def speak(i: int, text: str) -> tuple[bytes, int]:
-            async with limit:
-                result = await retry(lambda: self.speak(text), o.retries, f"{name}: voicing piece {i + 1}")
+            digest = hashlib.sha1(f"{o.tts_model}|{o.language}|{o.style}|{text}".encode()).hexdigest()[:16]
+            key = f"speech-{o.voice}-{digest}.wav"
+            result = work.load_audio(key)
+            if result is None:
+                async with limit:
+                    result = await retry(lambda: self.speak(text), o.retries, f"{name}: voicing piece {i + 1}")
+                work.save_audio(key, *result)
+                seconds = len(result[0]) / SAMPLE_WIDTH / result[1]
+                if seconds < len(text) / 40:  # far faster than anyone speaks: likely cut short
+                    log.warning("%s: voice piece %d is only %.0fs for %d characters; it may be cut short",
+                                name, i + 1, seconds, len(text))
             progress.done += 1
             return result
 
@@ -318,3 +388,7 @@ class Dubber:
         await asyncio.to_thread(write_wav, job.output, audio, rate)
         write_transcripts(job, "\n\n".join(translated), "\n\n".join(source))
         log.info("%s: wrote %s (%.1f min)", name, job.output, len(audio) / SAMPLE_WIDTH / rate / 60)
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9-]", "_", text)

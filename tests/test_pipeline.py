@@ -9,7 +9,7 @@ from google.genai import errors
 from livedub import cli, pipeline
 from livedub.pipeline import Job, collect_jobs, translate_file
 from livedub.translator import Translator
-from tests.fakes import FakeClient
+from tests.fakes import FakeClient, FakeModels, daily_quota_error
 
 needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
 
@@ -120,9 +120,55 @@ def test_run_all_cancels_the_rest_on_failure():
     assert finished == []
 
 
+def rate_limit_error(delay="0s"):
+    return errors.ClientError(429, {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "details": [
+        {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": delay}]}})
+
+
+def flaky(*failures):
+    calls = []
+
+    async def call():
+        calls.append(1)
+        if len(calls) <= len(failures):
+            raise failures[len(calls) - 1]
+        return "ok"
+
+    return call, calls
+
+
+def test_daily_quota_fails_at_once(monkeypatch):
+    call, calls = flaky(daily_quota_error())
+    with pytest.raises(pipeline.QuotaExhausted) as info:
+        asyncio.run(pipeline.retry(call, retries=5, label="x"))
+    assert len(calls) == 1
+    assert (info.value.model, info.value.per_day, info.value.wait_seconds) == ("gemini-3.8-flash", True, 34463)
+
+
+def test_short_rate_limits_are_waited_out(monkeypatch):
+    monkeypatch.setattr(pipeline, "RATE_LIMIT_PADDING", 0)
+    call, calls = flaky(rate_limit_error(), rate_limit_error())
+    assert asyncio.run(pipeline.retry(call, retries=0, label="x")) == "ok"
+    assert len(calls) == 3
+
+
+def test_long_rate_limit_counts_as_used_up(monkeypatch):
+    call, calls = flaky(rate_limit_error("600s"))
+    with pytest.raises(pipeline.QuotaExhausted) as info:
+        asyncio.run(pipeline.retry(call, retries=5, label="x"))
+    assert not info.value.per_day and len(calls) == 1
+
+
+def test_friendly_errors():
+    hint = pipeline.friendly_error(pipeline.QuotaExhausted("gemini-3.8-flash", 34463, True, ValueError()))
+    assert "gemini-3.8-flash" in hint and "۹ ساعت و ۳۴ دقیقه" in hint and "روزانه" in hint
+    assert "۱۱ دقیقه" in pipeline.friendly_error(pipeline.QuotaExhausted(None, 600, False, ValueError()))
+    assert "مدل پیدا نشد" in pipeline.friendly_error(errors.ClientError(404, {"error": {"message": "nope"}}))
+    assert pipeline.friendly_error(RuntimeError("boom")) is None
+
+
 def test_auth_errors_are_not_retried():
     assert not pipeline._retryable(errors.ClientError(403, {"error": {"message": "bad key"}}))
-    assert pipeline._retryable(errors.ClientError(429, {"error": {"message": "quota"}}))
     assert pipeline._retryable(errors.APIError(1011, "internal"))
 
 
@@ -165,6 +211,22 @@ def test_cli_quality_mode(tmp_path):
     assert (out / "talk.fa.txt").read_text(encoding="utf-8").startswith("ترجمه")
     assert client.models.of("speak")[0].config.speech_config.voice_config.prebuilt_voice_config.voice_name == "Puck"
     assert not client.sessions
+
+
+@needs_ffmpeg
+def test_cli_quality_mode_resumes_after_quota(tmp_path):
+    make_wav(tmp_path / "talk.wav", 3)
+    out = tmp_path / "out"
+    args = cli.parse_args([str(tmp_path / "talk.wav"), "-o", str(out)])
+    first = FakeClient(models=FakeModels(quota={"speak": 0}))
+    assert asyncio.run(cli.run(args, first)) == 1
+    assert (out / ".talk.fa.wav.parts").is_dir()
+
+    second = FakeClient()
+    assert asyncio.run(cli.run(args, second)) == 0
+    assert not second.models.of("transcribe") and not second.models.of("translate")
+    assert wav_frames(out / "talk.fa.wav") > 0
+    assert not (out / ".talk.fa.wav.parts").exists()
 
 
 def test_cli_needs_an_api_key(monkeypatch, tmp_path):

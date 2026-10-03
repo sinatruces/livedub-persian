@@ -44,6 +44,21 @@ def decode_to_pcm16(path: str | Path, rate: int = INPUT_RATE) -> bytes:
     return proc.stdout
 
 
+def encode_mp3(pcm: bytes, rate: int, bitrate: str = "32k") -> bytes:
+    """Compress 16-bit mono PCM to MP3. 32 kbit/s keeps speech intact at a fraction of the WAV size."""
+    cmd = [
+        "ffmpeg", "-nostdin", "-v", "error",
+        "-f", "s16le", "-ar", str(rate), "-ac", "1", "-i", "pipe:0",
+        "-codec:a", "libmp3lame", "-b:a", bitrate,
+        "-f", "mp3", "pipe:1",
+    ]
+    proc = subprocess.run(cmd, input=pcm, capture_output=True)
+    if proc.returncode != 0 or not proc.stdout:
+        detail = proc.stderr.decode(errors="replace").strip()
+        raise RuntimeError(f"ffmpeg could not encode MP3 (is it built with libmp3lame?): {detail}")
+    return proc.stdout
+
+
 def split_points(
     samples: np.ndarray,
     rate: int,

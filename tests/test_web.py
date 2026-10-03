@@ -224,7 +224,7 @@ def test_quality_job(tmp_path, monkeypatch):
         assert (job["stage"], job["done"]) == ("speak", job["total"])
         assert job["text_url"]  # quality mode always keeps the transcript
         text = await (await client.get(job["text_url"])).text()
-        assert text.startswith("ترجمه «Part 1 sentence 1.»")
+        assert text.startswith("ترجمه «Part ") and "sentence 1.»" in text
         audio = await client.get(job["audio_url"])
         assert (await audio.read())[:4] == b"RIFF"
 
@@ -257,3 +257,28 @@ def test_voice_sample_failure_is_reported(tmp_path, monkeypatch):
         assert res.status == 502 and "overloaded" in (await res.json())["error"]
 
     run(app, scenario)
+
+
+@needs_ffmpeg
+def test_quota_error_explains_and_resumes(tmp_path):
+    fake = FakeClient(models=FakeModels(quota={"translate": 0}))
+    app, _ = make_app(tmp_path, fake=fake)
+    src = make_wav(tmp_path / "talk.wav", 3)
+
+    async def scenario(client):
+        [job] = await (await client.post("/api/jobs", data=upload_form(src, mode="quality"))).json()
+        job = await wait_for(client, job["id"])
+        assert job["status"] == "error"
+        assert "۹ ساعت و ۳۴ دقیقه" in job["hint"] and "QuotaExhausted" in job["error"]
+        assert (tmp_path / "data" / job["id"] / "work").is_dir()
+
+        fake.models.quota.clear()  # the next day
+        resumed = await client.post(f"/api/jobs/{job['id']}/resume")
+        assert resumed.status == 200 and (await resumed.json())["status"] == "running"
+        job = await wait_for(client, job["id"])
+        assert job["status"] == "done" and job["hint"] is None
+        assert not (tmp_path / "data" / job["id"] / "work").exists()
+        assert (await client.post(f"/api/jobs/{job['id']}/resume")).status == 409
+
+    run(app, scenario)
+    assert len(fake.models.of("transcribe")) == 1  # transcribed once, reused on resume

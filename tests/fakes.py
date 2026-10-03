@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -13,6 +14,8 @@ from livedub.audio import wav_bytes
 
 # One "translated" chunk is 0.1 s of a constant non-zero sample at 24 kHz.
 REPLY_CHUNK = (1000).to_bytes(2, "little", signed=True) * 2400
+# Fake speech is 50 ms (1200 samples at 24 kHz) per character, about how fast people talk.
+SAMPLES_PER_CHAR = 1200
 
 
 def audio_message(data: bytes, rate: int = 24000) -> types.LiveServerMessage:
@@ -80,6 +83,24 @@ class FakeSession:
                 return
 
 
+def daily_quota_error(model: str = "gemini-3.8-flash", retry_delay: str = "34463s") -> errors.ClientError:
+    """The 429 the Gemini API sends when a free-tier daily quota is used up."""
+    return errors.ClientError(429, {"error": {
+        "code": 429,
+        "message": f"You exceeded your current quota... limit: 20, model: {model}",
+        "status": "RESOURCE_EXHAUSTED",
+        "details": [
+            {"@type": "type.googleapis.com/google.rpc.QuotaFailure", "violations": [{
+                "quotaMetric": "generativelanguage.googleapis.com/generate_content_free_tier_requests",
+                "quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+                "quotaDimensions": {"location": "global", "model": model},
+                "quotaValue": "20",
+            }]},
+            {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": retry_delay},
+        ],
+    }})
+
+
 def _response(*parts: types.Part) -> types.GenerateContentResponse:
     return types.GenerateContentResponse(
         candidates=[types.Candidate(content=types.Content(role="model", parts=list(parts)))]
@@ -89,16 +110,19 @@ def _response(*parts: types.Part) -> types.GenerateContentResponse:
 class FakeModels:
     """Stands in for client.aio.models: transcribes, translates and speaks predictably.
 
-    Transcription returns `paragraphs` sentences per audio part, translation wraps each paragraph
-    in «ترجمه …», and speech is 10 ms of audio per character. `failures` makes the first N calls
-    of a kind ("transcribe", "translate", "speak") fail like an overloaded server.
+    Transcription returns `paragraphs` sentences per audio part, labelled by a hash of the audio so
+    the same audio always gives the same text; translation wraps each paragraph in «ترجمه …»; and
+    speech is SAMPLES_PER_CHAR samples per character. `failures` makes the first N calls
+    of a kind ("transcribe", "translate", "speak") fail like an overloaded server; `quota` lets N
+    calls of a kind succeed and answers the rest with a used-up daily quota.
     """
 
-    def __init__(self, paragraphs: int = 2, silent: bool = False, wav_tts: bool = False, failures=None):
+    def __init__(self, paragraphs: int = 2, silent: bool = False, wav_tts: bool = False, failures=None, quota=None):
         self.paragraphs = paragraphs
         self.silent = silent
         self.wav_tts = wav_tts
         self.failures = dict(failures or {})
+        self.quota = dict(quota or {})
         self.calls: list[SimpleNamespace] = []
 
     def of(self, kind: str) -> list[SimpleNamespace]:
@@ -113,13 +137,17 @@ class FakeModels:
             kind = "translate"
         self.calls.append(SimpleNamespace(kind=kind, model=model, contents=contents, config=config))
         await asyncio.sleep(0)
+        if kind in self.quota:
+            if self.quota[kind] <= 0:
+                raise daily_quota_error(model)
+            self.quota[kind] -= 1
         if self.failures.get(kind):
             self.failures[kind] -= 1
             raise errors.ServerError(503, {"error": {"message": "The model is overloaded."}})
 
         if kind == "transcribe":
-            n = len(self.of("transcribe"))
-            paragraphs = [] if self.silent else [f"Part {n} sentence {i}." for i in range(1, self.paragraphs + 1)]
+            tag = hashlib.sha1(contents[0].inline_data.data).hexdigest()[:6]
+            paragraphs = [] if self.silent else [f"Part {tag} sentence {i}." for i in range(1, self.paragraphs + 1)]
             return _response(types.Part(text=json.dumps({"paragraphs": paragraphs})))
         if kind == "translate":
             request = json.loads(contents)
@@ -127,7 +155,7 @@ class FakeModels:
             return _response(types.Part(text=json.dumps({"paragraphs": translated}, ensure_ascii=False)))
 
         text = contents.split("\n\n", 1)[1]  # drop the delivery direction line
-        pcm = REPLY_CHUNK[:2] * (240 * len(text))
+        pcm = REPLY_CHUNK[:2] * (SAMPLES_PER_CHAR * len(text))
         if self.wav_tts:
             blob = types.Blob(data=wav_bytes(pcm, 24000), mime_type="audio/wav")
         else:

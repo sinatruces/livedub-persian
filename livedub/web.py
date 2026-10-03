@@ -22,7 +22,7 @@ from google.genai import errors
 
 from .audio import MEDIA_EXTENSIONS
 from .dubber import DEFAULT_VOICE, STYLES, TEXT_MODEL, TTS_MODEL, VOICES, Dubber, DubOptions
-from .pipeline import Job, Progress, transcript_paths, translate_file
+from .pipeline import Job, Progress, friendly_error, transcript_paths, translate_file
 from .translator import DEFAULT_MODEL, Translator
 
 log = logging.getLogger("livedub.web")
@@ -95,8 +95,10 @@ class WebJob:
     voice: str = DEFAULT_VOICE
     style: str = "formal"
     created: float = field(default_factory=time.time)
+    started: float = field(default_factory=time.time)
     status: str = "running"  # running | done | error | cancelled
     error: str = ""
+    hint: str | None = None  # a Persian explanation of the error, when there is one
     progress: Progress = field(default_factory=Progress)
     finished: float | None = None
     task: asyncio.Task | None = None
@@ -104,6 +106,10 @@ class WebJob:
     @property
     def output(self) -> Path:
         return self.dir / "output.wav"
+
+    @property
+    def work_dir(self) -> Path:
+        return self.dir / "work"
 
     @property
     def text_file(self) -> Path:
@@ -124,12 +130,13 @@ class WebJob:
             "style": self.style if self.mode == "quality" else None,
             "status": self.status,
             "error": self.error,
+            "hint": self.hint,
             "duration": round(self.progress.duration, 1),
             "stage": self.progress.stage,
             "done": self.progress.done,
             "total": self.progress.total,
             "fraction": round(self.progress.fraction, 4),
-            "elapsed": round((self.finished or time.time()) - self.created, 1),
+            "elapsed": round((self.finished or time.time()) - self.started, 1),
             "audio_url": f"/api/jobs/{self.id}/audio" if done else None,
             "text_url": f"/api/jobs/{self.id}/text" if done and self.text_file.exists() else None,
             "source_url": f"/api/jobs/{self.id}/source",
@@ -178,6 +185,7 @@ class WebApp:
             web.get("/api/jobs", self.list_jobs),
             web.post("/api/jobs", self.create_jobs),
             web.post("/api/jobs/{id}/cancel", self.cancel_job),
+            web.post("/api/jobs/{id}/resume", self.resume_job),
             web.delete("/api/jobs/{id}", self.delete_job),
             web.get("/api/jobs/{id}/audio", self.job_audio),
             web.get("/api/jobs/{id}/text", self.job_text),
@@ -253,7 +261,7 @@ class WebApp:
         for name, folder, source in uploads:
             job = WebJob(folder.name, name, source=source, dir=folder, **settings)
             self.jobs[job.id] = job
-            job.task = asyncio.create_task(self._run(job))
+            self._start(job)
             created.append(job.to_json())
         return web.json_response(created, status=201)
 
@@ -312,7 +320,9 @@ class WebApp:
 
     async def _translate(self, job: WebJob) -> None:
         if job.mode == "quality":
-            await self._dubber(job.lang, job.voice, job.style).dub_file(Job(job.source, job.output), job.progress)
+            dubber = self._dubber(job.lang, job.voice, job.style)
+            await dubber.dub_file(Job(job.source, job.output), job.progress, work_dir=job.work_dir)
+            shutil.rmtree(job.work_dir, ignore_errors=True)
             return
         translator = Translator(
             self.client, job.lang, self.live_model, with_text=job.save_text, **self.translator_options
@@ -335,10 +345,16 @@ class WebApp:
             job.status = "cancelled"
             log.info("%s: cancelled", job.name)
         except Exception as e:
-            job.status, job.error = "error", f"{type(e).__name__}: {e}"
+            job.status, job.error, job.hint = "error", f"{type(e).__name__}: {e}", friendly_error(e)
             log.error("%s: failed: %s", job.name, job.error)
         finally:
             job.finished = time.time()
+
+    def _start(self, job: WebJob) -> None:
+        job.status, job.error, job.hint, job.finished = "running", "", None, None
+        job.started = time.time()
+        job.progress = Progress()
+        job.task = asyncio.create_task(self._run(job))
 
     def _job(self, request: web.Request) -> WebJob:
         job = self.jobs.get(request.match_info["id"])
@@ -361,8 +377,17 @@ class WebApp:
                 self.samples[key] = await dubber.preview()
             except Exception as e:
                 log.error("voice sample failed: %s: %s", type(e).__name__, e)
-                return _error(502, f"ساخت نمونه صدا ناموفق بود: {e}")
+                return _error(502, friendly_error(e) or f"ساخت نمونه صدا ناموفق بود: {e}")
         return web.Response(body=self.samples[key], content_type="audio/wav")
+
+    async def resume_job(self, request: web.Request) -> web.Response:
+        job = self._job(request)
+        if job.status not in ("error", "cancelled"):
+            return _error(409, "این کار در حال اجرا یا تمام‌شده‌ست.")
+        if self.client is None:
+            return _error(400, "اول کلید Gemini API رو وارد کنید.")
+        self._start(job)
+        return web.json_response(job.to_json())
 
     async def cancel_job(self, request: web.Request) -> web.Response:
         job = self._job(request)

@@ -15,7 +15,7 @@ from livedub.dubber import (
     translation_instructions,
 )
 from livedub.pipeline import Job, Progress
-from tests.fakes import FakeClient, FakeModels
+from tests.fakes import SAMPLES_PER_CHAR, FakeClient, FakeModels
 from tests.test_pipeline import make_wav
 
 needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
@@ -47,11 +47,11 @@ def test_group_for_speech_packs_and_splits():
     assert all(len(p) <= 35 for p in pieces)
 
 
-def dub(client, source, output, monkeypatch, **options):
+def dub(client, source, output, monkeypatch, work_dir=None, **options):
     monkeypatch.setattr(pipeline, "RETRY_BASE_SECONDS", 0.01)
     progress = Progress()
     job = Job(source, output)
-    asyncio.run(Dubber(client, DubOptions(**options)).dub_file(job, progress))
+    asyncio.run(Dubber(client, DubOptions(**options)).dub_file(job, progress, work_dir=work_dir))
     return progress
 
 
@@ -68,8 +68,8 @@ def test_dub_file_end_to_end(tmp_path, monkeypatch):
     transcribe = models.of("transcribe")
     assert len(transcribe) >= 3
     audio_part = transcribe[0].contents[0]
-    assert audio_part.inline_data.mime_type == "audio/wav"
-    assert audio_part.inline_data.data[:4] == b"RIFF"
+    assert audio_part.inline_data.mime_type == "audio/mpeg"
+    assert audio_part.inline_data.data[:3] == b"ID3" or audio_part.inline_data.data[0] == 0xFF
 
     # Each translation request carries the paragraphs translated just before it.
     translate = models.of("translate")
@@ -93,7 +93,7 @@ def test_dub_file_end_to_end(tmp_path, monkeypatch):
     gaps = (len(speak) - 1) * int(dubber.PIECE_GAP_SECONDS * 24000)
     with wave.open(str(out)) as w:
         assert w.getframerate() == 24000
-        assert w.getnframes() == spoken * 240 + gaps
+        assert w.getnframes() == spoken * SAMPLES_PER_CHAR + gaps
 
     assert progress.duration == pytest.approx(12, abs=0.05)
     assert (progress.stage, progress.done, progress.total) == ("speak", len(speak), len(speak))
@@ -132,3 +132,58 @@ def test_voice_preview_reads_a_sample_in_the_chosen_style():
 def test_rejects_unknown_style():
     with pytest.raises(ValueError):
         Dubber(FakeClient(), DubOptions(style="shouty"))
+
+
+@needs_ffmpeg
+def test_used_up_quota_resumes_where_it_stopped(tmp_path, monkeypatch):
+    monkeypatch.setattr(dubber, "TRANSCRIBE_SECONDS", 5)
+    monkeypatch.setattr(dubber, "SPEAK_CHARS", 60)
+    src = make_wav(tmp_path / "talk.wav", 12)
+    work = tmp_path / "work"
+
+    # Reference run without interruptions.
+    reference = FakeClient()
+    dub(reference, src, tmp_path / "ref.wav", monkeypatch, parallel=1)
+    parts = len(reference.models.of("transcribe"))
+    pieces = len(reference.models.of("speak"))
+    assert parts >= 3 and pieces >= 3
+
+    # Day 1: the quota runs out during transcription.
+    day1 = FakeClient(models=FakeModels(quota={"transcribe": 2}))
+    with pytest.raises(pipeline.QuotaExhausted) as info:
+        dub(day1, src, tmp_path / "out.wav", monkeypatch, work_dir=work, parallel=1)
+    assert info.value.per_day and info.value.model == "gemini-3.8-flash"
+    assert len(day1.models.of("transcribe")) == 3  # no pointless retries against a daily quota
+
+    # Day 2: transcription finishes, then the voice quota runs out part-way.
+    day2 = FakeClient(models=FakeModels(quota={"speak": 2}))
+    with pytest.raises(pipeline.QuotaExhausted):
+        dub(day2, src, tmp_path / "out.wav", monkeypatch, work_dir=work, parallel=1)
+    assert len(day2.models.of("transcribe")) == parts - 2
+    assert len(day2.models.of("translate")) == 1
+
+    # Day 3: only the missing voice pieces are made.
+    day3 = FakeClient()
+    dub(day3, src, tmp_path / "out.wav", monkeypatch, work_dir=work, parallel=1)
+    assert not day3.models.of("transcribe") and not day3.models.of("translate")
+    assert len(day3.models.of("speak")) == pieces - 2
+
+    with wave.open(str(tmp_path / "ref.wav")) as a, wave.open(str(tmp_path / "out.wav")) as b:
+        assert a.readframes(a.getnframes()) == b.readframes(b.getnframes())
+
+
+@needs_ffmpeg
+def test_changing_voice_or_style_redoes_only_what_depends_on_it(tmp_path, monkeypatch):
+    src = make_wav(tmp_path / "talk.wav", 3)
+    work = tmp_path / "work"
+    dub(FakeClient(), src, tmp_path / "a.wav", monkeypatch, work_dir=work)
+
+    new_voice = FakeClient()
+    dub(new_voice, src, tmp_path / "b.wav", monkeypatch, work_dir=work, voice="Puck")
+    assert not new_voice.models.of("transcribe") and not new_voice.models.of("translate")
+    assert new_voice.models.of("speak")
+
+    new_style = FakeClient()
+    dub(new_style, src, tmp_path / "c.wav", monkeypatch, work_dir=work, style="casual")
+    assert not new_style.models.of("transcribe")
+    assert new_style.models.of("translate") and new_style.models.of("speak")
